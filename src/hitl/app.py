@@ -19,17 +19,14 @@ if str(SRC) not in sys.path:
 
 from io_utils import load_oct                                       # noqa: E402
 
-from .boundary_model import BoundaryEditor, ERASED_THRESHOLD        # noqa: E402
+from .boundary_model import (BOUNDARY_NAMES, BoundaryEditor,
+                              ERASED_THRESHOLD)                      # noqa: E402
 from .boundary_toggle import BoundaryToggleBar                      # noqa: E402
 from .canvas import EditMode, OverlayCanvas                         # noqa: E402
 from .overlay_render import render_corrected_overlay                # noqa: E402
 from .sidebar import FileEntry, FileListView                        # noqa: E402
 from .storage import (CorrectedSnapshot, Workbook,
                       load_workbook, save_corrections)              # noqa: E402
-
-
-# Boundary names in display order; used for status bar "edited:" summary.
-_BOUNDARY_NAMES = ("TOP_y", "ONL_y", "BM_y", "DET_top_y", "DET_bottom_y")
 
 
 class MainWindow(QMainWindow):
@@ -112,7 +109,7 @@ class MainWindow(QMainWindow):
     def _setup_shortcuts(self) -> None:
         # Boundary picker shortcuts: 1..5 select active boundary.
         keys = ["1", "2", "3", "4", "5"]
-        for k, name in zip(keys, _BOUNDARY_NAMES):
+        for k, name in zip(keys, BOUNDARY_NAMES):
             act = QAction(self)
             act.setShortcut(QKeySequence(k))
             act.triggered.connect(lambda _=False, n=name:
@@ -363,7 +360,7 @@ class MainWindow(QMainWindow):
         if editor is None:
             return
         edited: list[str] = []
-        for name in _BOUNDARY_NAMES:
+        for name in BOUNDARY_NAMES:
             if name not in editor.corrected:
                 continue
             corr = editor.corrected[name]

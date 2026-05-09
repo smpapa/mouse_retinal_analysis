@@ -32,8 +32,7 @@ from io_utils import load_oct                     # noqa: E402
 from oct_analyzer import BoundaryResult           # noqa: E402
 from viz import save_overlay                      # noqa: E402
 
-
-_BOUNDARY_KEYS = ("TOP_y", "ONL_y", "BM_y", "DET_top_y", "DET_bottom_y")
+from .boundary_model import BOUNDARY_NAMES         # noqa: E402
 
 
 def _fit_to_width(arr: np.ndarray | None, width: int) -> np.ndarray:
@@ -69,7 +68,7 @@ def render_corrected_overlay(image_path: str | Path,
     img = load_oct(image_path)
     w = img.layout.width
 
-    fitted = {k: _fit_to_width(boundaries.get(k), w) for k in _BOUNDARY_KEYS}
+    fitted = {k: _fit_to_width(boundaries.get(k), w) for k in BOUNDARY_NAMES}
 
     has_det = bool(np.any(np.isfinite(fitted["DET_top_y"])))
 

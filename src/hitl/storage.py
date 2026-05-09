@@ -22,10 +22,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.hitl.boundary_model import ERASED_MARKER, ERASED_THRESHOLD
+from src.hitl.boundary_model import (BOUNDARY_NAMES, ERASED_MARKER,
+                                       ERASED_THRESHOLD)
 
 
-AUTO_COLS = ("TOP_y", "ONL_y", "BM_y", "DET_top_y", "DET_bottom_y")
+# Re-exported for backwards compatibility — older callers import AUTO_COLS
+# directly from `storage`. Both names refer to the same canonical tuple.
+AUTO_COLS = BOUNDARY_NAMES
 
 # String literal written to xlsx to represent an erased (explicit-NaN) cell.
 ERASED_CELL_TEXT = "ERASED"

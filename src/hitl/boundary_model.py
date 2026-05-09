@@ -33,6 +33,13 @@ UNDO_DEPTH = 50
 # Gaussian falloff is truncated past this many sigmas.
 GAUSSIAN_RADIUS_SIGMAS = 3
 
+# Canonical ordered list of boundary names, used across modules
+# (storage columns, canvas line dict, app status bar, etc.). Single
+# source of truth so adding a new boundary needs only one edit.
+BOUNDARY_NAMES: tuple[str, ...] = (
+    "TOP_y", "ONL_y", "BM_y", "DET_top_y", "DET_bottom_y",
+)
+
 
 @dataclass
 class _Snapshot:

@@ -143,3 +143,17 @@ def test_mark_clean_resets_dirty(editor):
     assert not editor.dirty
     editor.apply_drag("TOP_y", 51, 41.0)
     assert editor.dirty
+
+
+def test_boundary_names_consistency():
+    """BOUNDARY_NAMES must match what storage / overlay_render / canvas use."""
+    from src.hitl.boundary_model import BOUNDARY_NAMES
+    from src.hitl.storage import AUTO_COLS
+    from src.hitl.canvas import COLORS
+
+    expected = ("TOP_y", "ONL_y", "BM_y", "DET_top_y", "DET_bottom_y")
+    assert BOUNDARY_NAMES == expected
+    # storage's AUTO_COLS is an alias of BOUNDARY_NAMES (re-exported).
+    assert AUTO_COLS is BOUNDARY_NAMES or tuple(AUTO_COLS) == expected
+    # canvas COLORS dict must cover every boundary (and only those).
+    assert set(COLORS.keys()) == set(BOUNDARY_NAMES)
