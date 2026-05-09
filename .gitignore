@@ -49,5 +49,11 @@ docs/**/*.pdf
 docs/**/*.zip
 docs/**/*.xlsx
 
+# Explicit large archive
+docs/쥐 데이터.zip
+
+# Derived outputs (anywhere)
+**/output/
+
 # Project data (usually large / derived)
 data/
