@@ -46,6 +46,16 @@ def load_workbook(path: str | Path) -> Workbook:
     summary = pd.read_excel(xls, sheet_name="summary")
     wb = Workbook(path=p, summary=summary)
 
+    # Sheet names may be truncated to 28 chars (with `_2`, `_3` for duplicates),
+    # so we cannot derive the original filename/stem from the sheet name.
+    # The batch writes summary rows and detail sheets in matching order, so we
+    # zip the detail sheets against the `filename` column from the summary.
+    if "filename" in summary.columns:
+        summary_filenames = summary["filename"].tolist()
+    else:
+        summary_filenames = []
+    fn_iter = iter(summary_filenames)
+
     for sheet in xls.sheet_names:
         if sheet == "summary":
             continue
@@ -54,18 +64,27 @@ def load_workbook(path: str | Path) -> Workbook:
         df = pd.read_excel(xls, sheet_name=sheet)
         if "x_local" not in df.columns:
             continue
+        try:
+            filename = next(fn_iter)
+        except StopIteration:
+            # No corresponding summary row (e.g. unrelated future sheet).
+            continue
         width = len(df)
-        rec = ImageRecord(stem=sheet, filename=f"{sheet}.tif", width=width)
+        stem = Path(str(filename)).stem
+        rec = ImageRecord(stem=stem, filename=str(filename), width=width)
         for name in AUTO_COLS:
-            rec.auto[name] = (
-                df[name].to_numpy(dtype=float)
-                if name in df.columns
-                else np.full(width, np.nan, dtype=float)
-            )
+            if name in df.columns:
+                rec.auto[name] = pd.to_numeric(
+                    df[name], errors="coerce"
+                ).to_numpy(dtype=float)
+            else:
+                rec.auto[name] = np.full(width, np.nan, dtype=float)
             corr_col = f"{name}_corrected"
             if corr_col in df.columns:
-                rec.corrected[name] = df[corr_col].to_numpy(dtype=float)
+                rec.corrected[name] = pd.to_numeric(
+                    df[corr_col], errors="coerce"
+                ).to_numpy(dtype=float)
             else:
                 rec.corrected[name] = np.full(width, np.nan, dtype=float)
-        wb.images[sheet] = rec
+        wb.images[stem] = rec
     return wb
