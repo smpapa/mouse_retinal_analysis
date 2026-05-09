@@ -182,6 +182,8 @@ class OverlayCanvas(QGraphicsView):
     def _cancel_drag_if_any(self) -> None:
         """Cleanly close any in-progress drag/pan so external state changes are safe."""
         if self._dragging and self.editor is not None and self._mode is EditMode.DRAG:
+            # Live drag uses the paint API; close that session too.
+            self.editor.end_paint()
             self.editor.end_drag()
         self._dragging = False
         if self._panning:
@@ -246,11 +248,10 @@ class OverlayCanvas(QGraphicsView):
             y = float(scene_pt.y())
             if 0 <= x < self.editor.width:
                 if self._mode is EditMode.DRAG:
-                    single = bool(event.modifiers() & Qt.ControlModifier)
-                    self.editor.begin_drag(
-                        self._active, x, sigma=DRAG_SIGMA, single=single,
-                    )
-                    self.editor.update_drag(y)
+                    # Live drag uses paint-trace: the boundary follows the
+                    # mouse path exactly. Pressing without moving still
+                    # writes the press column with the press y.
+                    self.editor.begin_paint(self._active, x, y)
                     self._dragging = True
                     self._refresh_lines()
                     return
@@ -277,7 +278,9 @@ class OverlayCanvas(QGraphicsView):
             x = int(round(scene_pt.x() - self._image_offset_x))
             y = float(scene_pt.y())
             if self._mode is EditMode.DRAG:
-                self.editor.update_drag(y)
+                # Paint-trace: write every column between the previous and
+                # current mouse position by linear interpolation.
+                self.editor.paint_to(x, y)
                 self._refresh_lines()
                 return
             elif self._mode is EditMode.ERASE:
@@ -296,7 +299,7 @@ class OverlayCanvas(QGraphicsView):
         if event.button() == Qt.LeftButton and self._dragging:
             if (self._mode is EditMode.DRAG
                     and self.editor is not None):
-                self.editor.end_drag()
+                self.editor.end_paint()
             elif (self._mode is EditMode.ERASE
                     and self.editor is not None
                     and self._active is not None

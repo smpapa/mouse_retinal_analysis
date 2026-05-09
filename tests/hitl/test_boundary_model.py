@@ -157,3 +157,68 @@ def test_boundary_names_consistency():
     assert AUTO_COLS is BOUNDARY_NAMES or tuple(AUTO_COLS) == expected
     # canvas COLORS dict must cover every boundary (and only those).
     assert set(COLORS.keys()) == set(BOUNDARY_NAMES)
+
+
+def test_paint_session_writes_single_column(editor):
+    editor.begin_paint("TOP_y", x=10, y=42.0)
+    editor.end_paint()
+    eff = editor.effective("TOP_y")
+    assert eff[10] == pytest.approx(42.0)
+    assert editor.dirty is True
+
+
+def test_paint_to_interpolates_between_points(editor):
+    editor.begin_paint("TOP_y", x=10, y=20.0)
+    editor.paint_to(x=20, y=40.0)
+    editor.end_paint()
+    eff = editor.effective("TOP_y")
+    # Endpoints
+    assert eff[10] == pytest.approx(20.0)
+    assert eff[20] == pytest.approx(40.0)
+    # Midpoint should be ~30.0 by linear interpolation.
+    assert eff[15] == pytest.approx(30.0, abs=0.01)
+
+
+def test_paint_to_handles_reverse_direction(editor):
+    editor.begin_paint("TOP_y", x=30, y=20.0)
+    editor.paint_to(x=20, y=40.0)
+    editor.end_paint()
+    eff = editor.effective("TOP_y")
+    assert eff[30] == pytest.approx(20.0)
+    assert eff[20] == pytest.approx(40.0)
+    assert eff[25] == pytest.approx(30.0, abs=0.01)
+
+
+def test_paint_chain_extends_path(editor):
+    """A sequence of paint_to calls should write a continuous path."""
+    editor.begin_paint("TOP_y", x=10, y=20.0)
+    editor.paint_to(x=15, y=25.0)
+    editor.paint_to(x=20, y=30.0)
+    editor.end_paint()
+    eff = editor.effective("TOP_y")
+    assert eff[10] == pytest.approx(20.0)
+    assert eff[15] == pytest.approx(25.0)
+    assert eff[20] == pytest.approx(30.0)
+
+
+def test_paint_to_before_begin_is_noop(editor):
+    """paint_to without an active session should not raise or mutate."""
+    before = editor.effective("TOP_y").copy()
+    editor.paint_to(x=10, y=99.0)
+    assert np.allclose(editor.effective("TOP_y"), before)
+    assert editor.dirty is False
+
+
+def test_paint_session_pushes_only_one_undo(editor):
+    editor.begin_paint("TOP_y", x=10, y=20.0)
+    editor.paint_to(x=15, y=25.0)
+    editor.paint_to(x=20, y=30.0)
+    editor.end_paint()
+    # One undo entry rolls back the whole session.
+    pre_undo = editor.effective("TOP_y").copy()
+    editor.undo()
+    eff = editor.effective("TOP_y")
+    assert not np.allclose(eff, pre_undo)
+    # All painted columns are restored to auto.
+    for x in (10, 15, 20):
+        assert eff[x] == pytest.approx(editor.auto["TOP_y"][x])

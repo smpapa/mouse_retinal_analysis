@@ -125,6 +125,36 @@ class CorrectedSnapshot:
     timestamp: datetime
 
 
+def _read_column(ws, col_idx: int, n_rows: int) -> np.ndarray:
+    """Read a numeric column from openpyxl worksheet (1-based col_idx,
+    skipping the header row). Non-numeric / blank cells become NaN."""
+    out = np.full(n_rows, np.nan, dtype=float)
+    for i, row in enumerate(ws.iter_rows(min_row=2, max_row=n_rows + 1,
+                                          min_col=col_idx, max_col=col_idx,
+                                          values_only=True)):
+        v = row[0]
+        if isinstance(v, (int, float)) and not (
+                isinstance(v, float) and np.isnan(v)):
+            out[i] = float(v)
+    return out
+
+
+def _read_corrected_column(ws, col_idx: int, n_rows: int) -> np.ndarray:
+    """Like _read_column, but maps the literal "ERASED" string to NaN
+    and returns the parsed numeric column for thickness recompute."""
+    out = np.full(n_rows, np.nan, dtype=float)
+    for i, row in enumerate(ws.iter_rows(min_row=2, max_row=n_rows + 1,
+                                          min_col=col_idx, max_col=col_idx,
+                                          values_only=True)):
+        v = row[0]
+        if v == ERASED_CELL_TEXT:
+            out[i] = np.nan
+        elif isinstance(v, (int, float)) and not (
+                isinstance(v, float) and np.isnan(v)):
+            out[i] = float(v)
+    return out
+
+
 def save_corrections(path: str | Path,
                      snapshots: list[CorrectedSnapshot],
                      scale_um_per_px_y: float) -> None:
@@ -137,90 +167,145 @@ def save_corrections(path: str | Path,
         `"ERASED"` so spreadsheets stay human-readable.
       - Append/update a row in `corrected_summary`.
 
+    Uses openpyxl in-place mutation so untouched sheets are not rewritten
+    — important when the workbook has 96 sheets and the user saves often.
     The write is atomic: we serialize to a sibling `.tmp` file and then
-    `os.replace()` it over the target so a crash mid-write cannot leave
-    the user with a corrupted workbook.
+    `os.replace()` it over the target.
     """
+    from openpyxl import load_workbook as _openpyxl_load
     p = Path(path)
 
-    # Read the whole workbook into memory so we can rewrite it. Use a
-    # context manager so the underlying file handle is released before
-    # we open the path for writing (Windows would otherwise raise a
-    # sharing violation).
-    with pd.ExcelFile(p) as xls:
-        sheets: dict[str, pd.DataFrame] = {
-            name: pd.read_excel(xls, sheet_name=name)
-            for name in xls.sheet_names
-        }
+    wb = _openpyxl_load(str(p))
+
+    # Build stem -> sheet_name map by walking the summary sheet's
+    # `filename` column in order. The batch pipeline writes detail sheets
+    # in matching order, so we zip them together.
+    stem_to_sheet: dict[str, str] = {}
+    summary_ws = wb["summary"] if "summary" in wb.sheetnames else None
+    if summary_ws is not None:
+        headers = [c.value for c in summary_ws[1]]
+        if "filename" in headers:
+            fn_col = headers.index("filename") + 1
+            data_sheets = [s for s in wb.sheetnames
+                           if s not in ("summary", "corrected_summary")]
+            for row_idx, sheet_name in enumerate(data_sheets, start=2):
+                cell_value = summary_ws.cell(row=row_idx, column=fn_col).value
+                if cell_value:
+                    stem = Path(str(cell_value)).stem
+                    stem_to_sheet[stem] = sheet_name
 
     summary_rows: list[dict] = []
 
     for snap in snapshots:
-        if snap.stem not in sheets:
+        sheet_name = stem_to_sheet.get(snap.stem)
+        if sheet_name is None or sheet_name not in wb.sheetnames:
             continue
-        df = sheets[snap.stem]
+        ws = wb[sheet_name]
 
-        # Apply each boundary's edits.
+        # Locate or create columns by header.
+        headers = [c.value for c in ws[1]]
+        col_idx: dict[str, int] = {
+            h: i + 1 for i, h in enumerate(headers) if h is not None
+        }
+        n_rows = ws.max_row - 1  # excludes header
+
+        def ensure_col(name: str) -> int:
+            if name in col_idx:
+                return col_idx[name]
+            new_idx = len(col_idx) + 1
+            ws.cell(row=1, column=new_idx, value=name)
+            col_idx[name] = new_idx
+            return new_idx
+
+        # Write each boundary's corrected column.
         any_corrected: dict[str, bool] = {}
         for name, arr in snap.corrected.items():
-            corr_col = f"{name}_corrected"
-            # Build a list of cell values: erased -> "ERASED",
-            # finite -> number, NaN -> empty.
-            cells = []
-            for v in arr.tolist():
+            c = ensure_col(f"{name}_corrected")
+            for i, v in enumerate(arr.tolist()):
                 if v < ERASED_THRESHOLD:
-                    cells.append(ERASED_CELL_TEXT)
+                    cell_value = ERASED_CELL_TEXT
                 elif np.isnan(v):
-                    cells.append(np.nan)
+                    cell_value = None
                 else:
-                    cells.append(float(v))
-            df[corr_col] = cells
-            any_corrected[name] = any(_is_set_cell(c) for c in cells)
+                    cell_value = float(v)
+                ws.cell(row=i + 2, column=c, value=cell_value)
+            erased_mask = arr < ERASED_THRESHOLD
+            finite_mask = (~np.isnan(arr)) & (~erased_mask)
+            any_corrected[name] = bool(erased_mask.any() or finite_mask.any())
 
         # Recompute thicknesses using effective boundary values
         # (auto where no correction, corrected otherwise).
         eff: dict[str, np.ndarray] = {}
         for name in AUTO_COLS:
-            auto = df[name].to_numpy(dtype=float) if name in df.columns \
-                else np.full(len(df), np.nan, dtype=float)
-            corr_col = f"{name}_corrected"
-            corr_raw = df[corr_col].tolist() if corr_col in df.columns else []
-            out = auto.copy()
-            for i, v in enumerate(corr_raw):
-                if v == ERASED_CELL_TEXT:
-                    out[i] = np.nan
-                elif isinstance(v, (int, float, np.integer, np.floating)) \
-                        and not (isinstance(v, float) and np.isnan(v)):
-                    out[i] = float(v)
-            eff[name] = out
+            if name in col_idx:
+                auto = _read_column(ws, col_idx[name], n_rows)
+            else:
+                auto = np.full(n_rows, np.nan, dtype=float)
+            corr_col_name = f"{name}_corrected"
+            if corr_col_name in col_idx:
+                corr = _read_corrected_column(ws, col_idx[corr_col_name],
+                                                n_rows)
+                # The corrected-column read just gives finite values where
+                # set OR explicit NaN where erased; auto is the fallback.
+                # Build effective: corr if cell text was "ERASED" -> NaN,
+                # else corr if finite, else auto.
+                # Easier: re-read with a more explicit pass.
+                erased = np.zeros(n_rows, dtype=bool)
+                for i, row in enumerate(ws.iter_rows(
+                        min_row=2, max_row=n_rows + 1,
+                        min_col=col_idx[corr_col_name],
+                        max_col=col_idx[corr_col_name],
+                        values_only=True)):
+                    erased[i] = (row[0] == ERASED_CELL_TEXT)
+                out = auto.copy()
+                # finite corrected → override
+                set_mask = ~np.isnan(corr) & ~erased
+                out[set_mask] = corr[set_mask]
+                out[erased] = np.nan
+                eff[name] = out
+            else:
+                eff[name] = auto
 
-        # total = (BM - TOP) * scale, outer = (BM - ONL) * scale,
-        # det = (DET_b - DET_t) * scale
-        df["total_thickness_um_corrected"] = \
-            (eff["BM_y"] - eff["TOP_y"]) * scale_um_per_px_y
-        df["outer_thickness_um_corrected"] = \
-            (eff["BM_y"] - eff["ONL_y"]) * scale_um_per_px_y
-        df["detachment_thickness_um_corrected"] = \
-            (eff["DET_bottom_y"] - eff["DET_top_y"]) * scale_um_per_px_y
+        # Write thickness columns.
+        total = (eff["BM_y"] - eff["TOP_y"]) * scale_um_per_px_y
+        outer = (eff["BM_y"] - eff["ONL_y"]) * scale_um_per_px_y
+        det = (eff["DET_bottom_y"] - eff["DET_top_y"]) * scale_um_per_px_y
+        for col_name, vals in (
+            ("total_thickness_um_corrected", total),
+            ("outer_thickness_um_corrected", outer),
+            ("detachment_thickness_um_corrected", det),
+        ):
+            c = ensure_col(col_name)
+            for i, v in enumerate(vals.tolist()):
+                ws.cell(row=i + 2, column=c,
+                        value=(None if np.isnan(v) else float(v)))
 
-        # corrected_by_user flag for the row.
-        any_per_col = np.zeros(len(df), dtype=bool)
+        # corrected_by_user flag per row.
+        c_flag = ensure_col("corrected_by_user")
+        any_per_col = np.zeros(n_rows, dtype=bool)
         for name in AUTO_COLS:
-            corr_col = f"{name}_corrected"
-            if corr_col not in df.columns:
+            corr_col_name = f"{name}_corrected"
+            if corr_col_name not in col_idx:
                 continue
-            for i, v in enumerate(df[corr_col].tolist()):
-                if _is_set_cell(v):
+            cc = col_idx[corr_col_name]
+            for i, row in enumerate(ws.iter_rows(
+                    min_row=2, max_row=n_rows + 1,
+                    min_col=cc, max_col=cc, values_only=True)):
+                if _is_set_cell(row[0]):
                     any_per_col[i] = True
-        df["corrected_by_user"] = any_per_col
+        for i, v in enumerate(any_per_col.tolist()):
+            ws.cell(row=i + 2, column=c_flag, value=bool(v))
 
-        sheets[snap.stem] = df
-
-        # Build the summary row.
+        # Build the corrected_summary row.
         n_corr = int(any_per_col.sum())
-        mean_total = float(np.nanmean(df["total_thickness_um"])) \
-            if "total_thickness_um" in df.columns else float("nan")
-        mean_total_corr = float(np.nanmean(df["total_thickness_um_corrected"]))
+        if "total_thickness_um" in col_idx:
+            auto_total = _read_column(ws, col_idx["total_thickness_um"], n_rows)
+            mean_total = float(np.nanmean(auto_total)) \
+                if not np.all(np.isnan(auto_total)) else float("nan")
+        else:
+            mean_total = float("nan")
+        mean_total_corr = float(np.nanmean(total)) \
+            if not np.all(np.isnan(total)) else float("nan")
         summary_rows.append({
             "filename": f"{snap.stem}.tif",
             "n_corrected_cols": n_corr,
@@ -234,27 +319,50 @@ def save_corrections(path: str | Path,
             "edit_timestamp": snap.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
         })
 
-    # Merge into / create corrected_summary.
+    # corrected_summary: append/replace rows for the saved stems.
     if summary_rows:
-        if "corrected_summary" in sheets:
-            old = sheets["corrected_summary"]
-            new = pd.DataFrame(summary_rows)
-            # Replace rows for files we just edited, keep others.
-            edited_files = set(r["filename"] for r in summary_rows)
-            if "filename" in old.columns:
-                old = old[~old["filename"].isin(edited_files)]
-            sheets["corrected_summary"] = pd.concat(
-                [old, new], ignore_index=True
-            )
+        cs_headers = ["filename", "n_corrected_cols",
+                      "corrected_TOP", "corrected_ONL",
+                      "corrected_BM", "corrected_DET",
+                      "mean_total_um", "mean_total_um_corrected",
+                      "edit_timestamp"]
+        if "corrected_summary" in wb.sheetnames:
+            cs = wb["corrected_summary"]
+            # Build filename -> row map (1-based, includes header row).
+            existing_headers = [c.value for c in cs[1]]
+            try:
+                fn_idx = existing_headers.index("filename") + 1
+            except ValueError:
+                fn_idx = 1
+            existing_rows: dict[str, int] = {}
+            for r in range(2, cs.max_row + 1):
+                v = cs.cell(row=r, column=fn_idx).value
+                if v:
+                    existing_rows[str(v)] = r
+            # Map header → 1-based col index in the existing sheet.
+            ex_col_idx = {h: i + 1 for i, h in enumerate(existing_headers)
+                          if h is not None}
+            # Ensure all our headers exist.
+            for hname in cs_headers:
+                if hname not in ex_col_idx:
+                    new_idx = len(ex_col_idx) + 1
+                    cs.cell(row=1, column=new_idx, value=hname)
+                    ex_col_idx[hname] = new_idx
+            for srow in summary_rows:
+                fn = srow["filename"]
+                target_row = existing_rows.get(fn, cs.max_row + 1)
+                for k, v in srow.items():
+                    cs.cell(row=target_row, column=ex_col_idx[k], value=v)
         else:
-            sheets["corrected_summary"] = pd.DataFrame(summary_rows)
-    # If summary_rows is empty: leave any existing corrected_summary
-    # untouched, and don't create a new (empty) one either.
+            cs = wb.create_sheet("corrected_summary")
+            for j, h in enumerate(cs_headers, start=1):
+                cs.cell(row=1, column=j, value=h)
+            for ri, srow in enumerate(summary_rows, start=2):
+                for j, h in enumerate(cs_headers, start=1):
+                    cs.cell(row=ri, column=j, value=srow[h])
 
-    # Write all sheets to a temp sibling and atomically replace, so a
-    # crash mid-write cannot corrupt the user's only workbook.
+    # Atomic write: save to .tmp, then os.replace.
     tmp = p.with_suffix(p.suffix + ".tmp")
-    with pd.ExcelWriter(tmp, engine="openpyxl", mode="w") as w:
-        for name, df in sheets.items():
-            df.to_excel(w, sheet_name=name, index=False)
-    os.replace(tmp, p)
+    wb.save(str(tmp))
+    wb.close()
+    os.replace(str(tmp), str(p))

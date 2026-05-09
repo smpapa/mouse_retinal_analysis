@@ -58,6 +58,13 @@ class _DragSession:
 
 
 @dataclass
+class _PaintSession:
+    name: str
+    last_x: int
+    last_y: float
+
+
+@dataclass
 class BoundaryEditor:
     width: int
     auto: dict[str, np.ndarray]
@@ -69,6 +76,7 @@ class BoundaryEditor:
     )
     _dirty: bool = field(init=False, default=False)
     _drag: Optional[_DragSession] = field(init=False, default=None)
+    _paint: Optional[_PaintSession] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self._touched = {
@@ -162,6 +170,46 @@ class BoundaryEditor:
     def end_drag(self) -> None:
         """Finish the drag session; subsequent `update_drag` is a no-op."""
         self._drag = None
+
+    def begin_paint(self, name: str, x: int, y: float) -> None:
+        """Start a paint-trace session.
+
+        Each subsequent `paint_to(x, y)` writes the boundary along a
+        straight line between the previous and current point — every
+        integer column in between gets a y from linear interpolation.
+        Pushes a single undo entry covering the whole session.
+        """
+        self._check_name(name)
+        x = max(0, min(self.width - 1, int(x)))
+        self._push_undo(name)
+        self._set(name, x, float(y))
+        self._paint = _PaintSession(name=name, last_x=x, last_y=float(y))
+        self._dirty = True
+
+    def paint_to(self, x: int, y: float) -> None:
+        """Linearly interpolate from the last point to (x, y), writing
+        every integer column between."""
+        if self._paint is None:
+            return
+        p = self._paint
+        x = max(0, min(self.width - 1, int(x)))
+        y = float(y)
+        if x == p.last_x:
+            self._set(p.name, x, y)
+        else:
+            step = 1 if x > p.last_x else -1
+            dx_total = x - p.last_x
+            for xi in range(p.last_x, x + step, step):
+                t = (xi - p.last_x) / dx_total
+                yi = p.last_y + t * (y - p.last_y)
+                self._set(p.name, xi, yi)
+        p.last_x = x
+        p.last_y = y
+        self._dirty = True
+
+    def end_paint(self) -> None:
+        """Finish the paint session; subsequent `paint_to` is a no-op."""
+        self._paint = None
 
     def apply_drag(self, name: str, x: int, y_new: float,
                    sigma: float = 5.0, single: bool = False) -> None:

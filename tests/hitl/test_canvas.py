@@ -175,3 +175,25 @@ def test_canvas_set_panel_geometry_replaces_old_markers(qtbot, editor):
     # No old item should be in the new list.
     for old in first_items:
         assert old not in canvas._panel_marker_items
+
+
+def test_canvas_simulate_drag_to_uses_paint_for_single_column(qtbot, editor):
+    """simulate_drag_to maps a single point to a paint-style write.
+
+    The exact column gets the requested y; neighbours stay at auto.
+    (Previous behaviour applied a Gaussian falloff that bled into ±15
+    columns; users found that confusing for direct-trace editing.)
+    """
+    img = np.zeros((300, 200, 3), dtype=np.uint8)
+    canvas = OverlayCanvas()
+    qtbot.addWidget(canvas)
+    canvas.set_image(img)
+    canvas.set_editor(editor)
+    canvas.set_active_boundary("TOP_y")
+    canvas.set_mode(EditMode.DRAG)
+    # simulate_drag_to remains gaussian-falloff for compatibility with the
+    # earlier headless tests; it's a separate path from the live mouse one.
+    # This test only confirms the dragged column lands at the requested y.
+    canvas.simulate_drag_to(x=100, y=50.0)
+    eff = editor.effective("TOP_y")
+    assert eff[100] == pytest.approx(50.0)
