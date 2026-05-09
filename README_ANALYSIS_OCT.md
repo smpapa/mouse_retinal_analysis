@@ -37,8 +37,8 @@
 
 예시:
 
-- [21_OS_4H.tif](/D:/workspace/sumin/data/mouse_data_org/21_OS_4H.tif)
-- [21_OS_6H.tif](/D:/workspace/sumin/data/mouse_data_org/21_OS_6H.tif)
+- [21_OS_4H.tif](/D:/workspace/sumin_claude/data/mouse_data_org/21_OS_4H.tif)
+- [21_OS_6H.tif](/D:/workspace/sumin_claude/data/mouse_data_org/21_OS_6H.tif)
 
 ## 최종 경계 정의
 
@@ -202,8 +202,8 @@ annotation 파일은 "정답 좌표를 그대로 복사하는 파일"이 아니�
 
 예시:
 
-- [21_OS_4H_annotation.tiff](/D:/workspace/sumin/data/mouse_data_org/annotation/21_OS_4H_annotation.tiff)
-- [21_OS_6H_annotation.tiff](/D:/workspace/sumin/data/mouse_data_org/annotation/21_OS_6H_annotation.tiff)
+- [21_OS_4H_annotation.tiff](/D:/workspace/sumin_claude/data/mouse_data_org/annotation/21_OS_4H_annotation.tiff)
+- [21_OS_6H_annotation.tiff](/D:/workspace/sumin_claude/data/mouse_data_org/annotation/21_OS_6H_annotation.tiff)
 
 annotation을 사용할 때 원칙:
 
@@ -327,7 +327,5 @@ annotation을 사용할 때 원칙:
 
 ## 관련 파일
 
-- 문서: [README_ANALYSIS_OCT.md](/D:/workspace/sumin/README_ANALYSIS_OCT.md)
-- 단일 이미지 분석: [analysis_oct_03.py](/D:/workspace/sumin/src/analysis_oct_03.py)
-- GT/배치 처리: [batch_gt_guided_processing.py](/D:/workspace/sumin/src/batch_gt_guided_processing.py)
+- 문서: [README_ANALYSIS_OCT.md](/D:/workspace/sumin_claude/README_ANALYSIS_OCT.md)
 - 출력 폴더: [output](/D:/workspace/sumin/data/mouse_data_org/output)

@@ -1,0 +1,12 @@
+detach구분 : 유무에 따라 있을때를 잡아서 세로운 레이어를 잡아야 한다 
+ 정상인 경우에는 detach는 없다고 잡고 전체 망막 두께 (Total retinal thickness)와 Outer Retina(BM ~ ONL) 두께를 측정
+detach가 있을 경우에는 Total, Outer Retina, Detach layer를 각각 측정해야함 (detach는 대개 새까맣다)
+
+BM 경계는 최대한 아래쪽에 있는 선명한 흰 선 경계
+ONL 경계는 : BM의 영역에서 제일 가까운 흰 선의 윗 경계
+total의 가장 위쪽 경계 : 새까맣기 직전의 마지막 흰 선 경계
+
+1. detach 구분
+2. layer 구분을 좀 더 명확히
+3. 각 레이어의 경계를 점선으로 그린 검증용 이미지 한장도 생성 
+

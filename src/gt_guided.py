@@ -1,0 +1,191 @@
+"""Annotation TIFF parsing + GT vs raw-detection comparison.
+
+Annotation colour mapping (from inspection of 21_OS_4H_annotation /
+21_OS_6H_annotation):
+
+  - BM       : magenta-ish  (R high, G low, B mid)
+  - TOP      : green-tinted (saturated greens that don't appear in the
+                              source TIFF Heidelberg crosshair markers)
+  - ONL      : cyan / blue
+  - DET top  : yellow-bright
+  - DET bot  : black (drawn on the lower edge of the cavity)
+
+GT is used **only** to report a per-boundary median |Δy| against the raw
+detection. Coordinates are never copied into the output.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+from PIL import Image
+
+from io_utils import OctImage
+
+
+# Boolean RGB masks. Each predicate is intentionally narrow so we don't
+# accidentally capture the original Heidelberg green crosshair markers.
+def _mask_bm(rgb: np.ndarray) -> np.ndarray:
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    return (R > 130) & (G < 100) & (B > 90)
+
+
+def _mask_top(rgb: np.ndarray, original_rgb: np.ndarray) -> np.ndarray:
+    """TOP green pixels appearing in the annotation but not in the source.
+
+    We exclude pixels that already exist as green in the original TIFF
+    (Heidelberg crosshair, scan markers, etc.).
+    """
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    is_green = (G > 110) & (G > R + 30) & (G > B + 30)
+    Ro, Go, Bo = original_rgb[..., 0], original_rgb[..., 1], original_rgb[..., 2]
+    same_as_orig = (R == Ro) & (G == Go) & (B == Bo)
+    return is_green & (~same_as_orig)
+
+
+def _mask_onl(rgb: np.ndarray) -> np.ndarray:
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    # Cyan/blue: B is the dominant channel
+    return (B > 130) & (B > R + 30)
+
+
+def _mask_det(rgb: np.ndarray) -> np.ndarray:
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    # Yellow: high R and G, low B
+    return (R > 130) & (G > 130) & (B < 80)
+
+
+@dataclass
+class GTBoundaries:
+    """Per-column GT y arrays in B-scan-relative coords (NaN where missing)."""
+    TOP: np.ndarray
+    ONL: np.ndarray
+    BM: np.ndarray
+    DET_top: np.ndarray
+    DET_bottom: np.ndarray
+
+
+def _column_y_from_mask(mask_crop: np.ndarray,
+                        y_lo: int = 0, y_hi: int | None = None) -> np.ndarray:
+    """Per column, return median y of True pixels in [y_lo, y_hi).
+
+    Restricting to a retinal y range avoids picking up coloured pixels in
+    image labels / scale bars that share the colour family. Median (not
+    mean) is robust to stray pixels outside the line.
+    """
+    H, W = mask_crop.shape
+    if y_hi is None:
+        y_hi = H
+    out = np.full(W, np.nan, dtype=np.float32)
+    if not mask_crop.any():
+        return out
+    sub = mask_crop[y_lo:y_hi]
+    if not sub.any():
+        return out
+    ys, xs = np.where(sub)
+    if xs.size == 0:
+        return out
+    ys = ys + y_lo
+    order = np.argsort(xs, kind="stable")
+    xs_s = xs[order]
+    ys_s = ys[order]
+    starts = np.searchsorted(xs_s, np.arange(W), side="left")
+    ends = np.searchsorted(xs_s, np.arange(W), side="right")
+    for x, (s, e) in enumerate(zip(starts, ends)):
+        if e > s:
+            out[x] = float(np.median(ys_s[s:e]))
+    return out
+
+
+def _split_run(mask_crop: np.ndarray, y_lo: int = 0, y_hi: int | None = None
+               ) -> tuple[np.ndarray, np.ndarray]:
+    """For DET: per-column (top_y, bottom_y) of the masked region in y range."""
+    H, W = mask_crop.shape
+    if y_hi is None:
+        y_hi = H
+    top = np.full(W, np.nan, dtype=np.float32)
+    bot = np.full(W, np.nan, dtype=np.float32)
+    for x in range(W):
+        col = mask_crop[y_lo:y_hi, x]
+        if not col.any():
+            continue
+        ys = np.where(col)[0] + y_lo
+        top[x] = float(ys.min())
+        bot[x] = float(ys.max())
+    return top, bot
+
+
+def load_gt(annotation_path: str | Path,
+            oct_image: OctImage) -> GTBoundaries:
+    """Extract per-column GT boundaries from an annotation TIFF.
+
+    The annotation must share the same image dimensions as `oct_image`.
+    """
+    p = Path(annotation_path)
+    anno = np.asarray(Image.open(str(p)).convert("RGB"), dtype=np.uint8)
+    if anno.shape[:2] != oct_image.rgb.shape[:2]:
+        raise ValueError(
+            f"Annotation shape {anno.shape[:2]} does not match "
+            f"image shape {oct_image.rgb.shape[:2]}")
+
+    l = oct_image.layout
+    crop = lambda m: m[l.top_y:l.bot_y + 1, l.left_x:l.right_x + 1]
+
+    bm_mask = crop(_mask_bm(anno))
+    top_mask = crop(_mask_top(anno, oct_image.rgb))
+    onl_mask = crop(_mask_onl(anno))
+    det_mask = crop(_mask_det(anno))
+
+    # Retinal layers live in roughly the upper half of the B-scan panel.
+    # Restricting the mean-y computation to this y range prevents stray
+    # cyan/magenta/yellow pixels in scale labels and UI text from polluting
+    # the GT extraction.
+    H = bm_mask.shape[0]
+    retinal_y_lo, retinal_y_hi = int(H * 0.10), int(H * 0.55)
+
+    BM = _column_y_from_mask(bm_mask, retinal_y_lo, retinal_y_hi)
+    TOP = _column_y_from_mask(top_mask, retinal_y_lo, retinal_y_hi)
+    ONL = _column_y_from_mask(onl_mask, retinal_y_lo, retinal_y_hi)
+    DET_top, DET_bot = _split_run(det_mask, retinal_y_lo, retinal_y_hi)
+
+    return GTBoundaries(TOP=TOP, ONL=ONL, BM=BM,
+                        DET_top=DET_top, DET_bottom=DET_bot)
+
+
+def median_abs_error(pred: np.ndarray, gt: np.ndarray) -> float:
+    """Median |Δy| over columns where both pred and gt are finite."""
+    valid = ~(np.isnan(pred) | np.isnan(gt))
+    if not valid.any():
+        return float("nan")
+    return float(np.median(np.abs(pred[valid] - gt[valid])))
+
+
+def compare(pred, gt: GTBoundaries) -> dict[str, float]:
+    """Return per-boundary median |Δy| (NaN where not comparable).
+
+    `pred` should be a `BoundaryResult` (uses TOP, ONL, BM, DET_top, DET_bottom).
+    """
+    return {
+        "TOP_median_err_px": median_abs_error(pred.TOP, gt.TOP),
+        "ONL_median_err_px": median_abs_error(pred.ONL, gt.ONL),
+        "BM_median_err_px": median_abs_error(pred.BM, gt.BM),
+        "DET_top_median_err_px": median_abs_error(pred.DET_top, gt.DET_top),
+        "DET_bottom_median_err_px": median_abs_error(pred.DET_bottom,
+                                                      gt.DET_bottom),
+    }
+
+
+def find_annotation(image_path: str | Path) -> Optional[Path]:
+    """Locate the matching annotation TIFF if one exists."""
+    p = Path(image_path)
+    cand = p.parent / "annotation" / (p.stem + "_annotation.tiff")
+    if cand.exists():
+        return cand
+    cand2 = p.parent / "annotation" / (p.stem + "_annotation.tif")
+    if cand2.exists():
+        return cand2
+    return None
+
+

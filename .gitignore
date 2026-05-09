@@ -1,0 +1,53 @@
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Cursor / agent artifacts (local-only)
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+.tox/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local runtime / temp
+temp/
+*.log
+
+# Docs / office files (large binaries)
+docs/~$*
+docs/**/*.pptx
+docs/**/*.pdf
+docs/**/*.zip
+docs/**/*.xlsx
+
+# Project data (usually large / derived)
+data/
