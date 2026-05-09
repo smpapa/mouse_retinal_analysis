@@ -81,6 +81,8 @@ class OverlayCanvas(QGraphicsView):
         # setPath. Avoids re-creating thousands of QGraphicsLineItems on
         # every drag mousemove.
         self._line_items: dict[str, QGraphicsPathItem] = {}
+        # Per-boundary visibility (rendering only — underlying data unchanged).
+        self._visible: dict[str, bool] = {name: True for name in COLORS}
         # Scene-x offset of the displayed B-scan image. Boundary arrays are
         # B-scan-local (0..width); add this to map to scene coordinates.
         self._image_offset_x: int = 0
@@ -152,6 +154,19 @@ class OverlayCanvas(QGraphicsView):
     def refresh(self) -> None:
         """Public re-render hook for callers that mutated the editor externally."""
         self._refresh_lines()
+
+    def set_boundary_visible(self, name: str, visible: bool) -> None:
+        """Show/hide a boundary line. Underlying data is untouched."""
+        if name not in self._visible:
+            return  # silent: ignore unknown names
+        self._visible[name] = bool(visible)
+        # Refresh the affected line item only.
+        item = self._line_items.get(name)
+        if item is not None:
+            item.setVisible(self._visible[name])
+
+    def boundary_visible(self, name: str) -> bool:
+        return self._visible.get(name, True)
 
     def _cancel_drag_if_any(self) -> None:
         """Cleanly close any in-progress drag/pan so external state changes are safe."""
@@ -330,6 +345,8 @@ class OverlayCanvas(QGraphicsView):
             pen = item.pen()
             pen.setWidthF(ACTIVE_LINE_WIDTH if is_active else LINE_WIDTH)
             item.setPen(pen)
+            # Apply current visibility (covers newly-created items too).
+            item.setVisible(self._visible[name])
 
     def _array_to_path(self, arr: np.ndarray) -> QPainterPath:
         path = QPainterPath()

@@ -9,7 +9,8 @@ import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (QApplication, QDockWidget, QMainWindow,
-                                QMessageBox, QStatusBar, QToolBar)
+                                QMessageBox, QStatusBar, QToolBar,
+                                QVBoxLayout, QWidget)
 
 # Make sibling analysis modules importable.
 SRC = Path(__file__).resolve().parents[1]
@@ -19,6 +20,7 @@ if str(SRC) not in sys.path:
 from io_utils import load_oct                                       # noqa: E402
 
 from .boundary_model import BoundaryEditor, ERASED_THRESHOLD        # noqa: E402
+from .boundary_toggle import BoundaryToggleBar                      # noqa: E402
 from .canvas import EditMode, OverlayCanvas                         # noqa: E402
 from .overlay_render import render_corrected_overlay                # noqa: E402
 from .sidebar import FileEntry, FileListView                        # noqa: E402
@@ -56,8 +58,20 @@ class MainWindow(QMainWindow):
         # Route through the dirty-check handler instead of select_image
         # directly so we can prompt before discarding unsaved edits.
         self.sidebar.image_selected.connect(self._on_sidebar_image_selected)
+
+        self.boundary_toggle = BoundaryToggleBar()
+        self.boundary_toggle.visibility_changed.connect(
+            self.canvas.set_boundary_visible
+        )
+
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.addWidget(self.sidebar, stretch=1)
+        container_layout.addWidget(self.boundary_toggle)
+
         dock = QDockWidget("Files", self)
-        dock.setWidget(self.sidebar)
+        dock.setWidget(container)
         dock.setAllowedAreas(Qt.LeftDockWidgetArea)
         self.addDockWidget(Qt.LeftDockWidgetArea, dock)
 

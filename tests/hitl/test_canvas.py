@@ -109,3 +109,17 @@ def test_canvas_set_editor_during_drag_cancels_cleanly(qtbot, editor):
     canvas.set_editor(new_ed)
     assert canvas._dragging is False
     assert canvas.editor is new_ed
+
+
+def test_canvas_set_boundary_visible_hides_line(qtbot, editor):
+    img = np.zeros((300, 200, 3), dtype=np.uint8)
+    canvas = OverlayCanvas()
+    qtbot.addWidget(canvas)
+    canvas.set_image(img)
+    canvas.set_editor(editor)
+    # All boundaries default to visible.
+    assert canvas.boundary_visible("TOP_y") is True
+    canvas.set_boundary_visible("TOP_y", False)
+    assert canvas.boundary_visible("TOP_y") is False
+    # Unknown name is a no-op.
+    canvas.set_boundary_visible("not_a_boundary", False)

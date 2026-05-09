@@ -133,3 +133,18 @@ def test_mainwindow_select_image_handles_missing_tiff(qtbot, tmp_path,
     # Status bar should mention the failure.
     msg = win.statusBar().currentMessage()
     assert "Could not load" in msg or "could not load" in msg.lower()
+
+
+def test_mainwindow_boundary_toggle_hides_canvas_line(qtbot, tmp_path,
+                                                      oct_results_xlsx,
+                                                      sample_image_stem):
+    dst = tmp_path / "oct_results.xlsx"
+    shutil.copy(oct_results_xlsx, dst)
+    win = MainWindow(workbook_path=dst, image_dir=oct_results_xlsx.parent.parent)
+    qtbot.addWidget(win)
+    win.select_image(sample_image_stem)
+    # Toggle TOP off via the toolbar's boundary toggle bar.
+    win.boundary_toggle._boxes["TOP_y"].setChecked(False)
+    assert win.canvas.boundary_visible("TOP_y") is False
+    # Other boundaries still visible.
+    assert win.canvas.boundary_visible("ONL_y") is True
