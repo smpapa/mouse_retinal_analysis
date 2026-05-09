@@ -63,3 +63,83 @@ def test_dirty_flag_true_after_edit(editor):
     assert not editor.dirty
     editor.apply_drag("TOP_y", 50, 40.0, sigma=5)
     assert editor.dirty
+
+
+def test_undo_on_empty_stack_is_noop(editor):
+    # No edits made, undo should not raise.
+    editor.undo()
+    assert np.allclose(editor.effective("TOP_y"), editor.auto["TOP_y"])
+
+
+def test_apply_drag_when_current_value_is_nan(editor):
+    # Set ONL to NaN at x=10 first via erase, then drag — should set the col directly.
+    editor.apply_erase("ONL_y", 10, 10)
+    editor.apply_drag("ONL_y", 10, 99.0, sigma=5)
+    eff = editor.effective("ONL_y")
+    assert eff[10] == pytest.approx(99.0)
+
+
+def test_apply_drag_at_left_edge(editor):
+    editor.apply_drag("BM_y", 0, 200.0, sigma=5)
+    eff = editor.effective("BM_y")
+    assert eff[0] == pytest.approx(200.0)
+
+
+def test_apply_drag_at_right_edge(editor):
+    editor.apply_drag("BM_y", editor.width - 1, 200.0, sigma=5)
+    eff = editor.effective("BM_y")
+    assert eff[editor.width - 1] == pytest.approx(200.0)
+
+
+def test_multiple_edits_stack_then_undo_one(editor):
+    editor.apply_drag("TOP_y", 30, 45.0, sigma=5, single=True)
+    editor.apply_drag("TOP_y", 60, 55.0, sigma=5, single=True)
+    eff_before = editor.effective("TOP_y").copy()
+    editor.apply_drag("TOP_y", 80, 50.0, sigma=5, single=True)
+    editor.undo()
+    assert np.allclose(editor.effective("TOP_y"), eff_before)
+
+
+def test_erase_persists_after_drag_on_different_column(editor):
+    editor.apply_erase("BM_y", 50, 60)
+    editor.apply_drag("BM_y", 10, 95.0, sigma=5, single=True)
+    eff = editor.effective("BM_y")
+    assert eff[10] == pytest.approx(95.0)
+    assert np.all(np.isnan(eff[50:61]))
+
+
+def test_apply_drag_session_does_not_compound(editor):
+    # Simulating an interactive drag: same anchor, multiple update calls.
+    editor.begin_drag("TOP_y", 50, sigma=5)
+    editor.update_drag(45.0)
+    after_first = editor.effective("TOP_y").copy()
+    # Second update with the same y should produce the same result
+    # (NOT compounded on top of the first).
+    editor.update_drag(45.0)
+    after_second = editor.effective("TOP_y").copy()
+    editor.end_drag()
+    assert np.allclose(after_first, after_second)
+
+
+def test_apply_drag_session_pushes_only_one_undo(editor):
+    editor.begin_drag("TOP_y", 50, sigma=5)
+    editor.update_drag(45.0)
+    editor.update_drag(46.0)
+    editor.update_drag(47.0)
+    editor.end_drag()
+    editor.undo()
+    assert np.allclose(editor.effective("TOP_y"), editor.auto["TOP_y"])
+
+
+def test_unknown_boundary_raises(editor):
+    with pytest.raises(KeyError):
+        editor.apply_drag("NOT_A_BOUNDARY", 10, 50.0)
+
+
+def test_mark_clean_resets_dirty(editor):
+    editor.apply_drag("TOP_y", 50, 40.0)
+    assert editor.dirty
+    editor.mark_clean()
+    assert not editor.dirty
+    editor.apply_drag("TOP_y", 51, 41.0)
+    assert editor.dirty

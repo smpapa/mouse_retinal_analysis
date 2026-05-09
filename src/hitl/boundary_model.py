@@ -13,7 +13,9 @@ for now: undo only.
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
 
@@ -21,6 +23,15 @@ import numpy as np
 # A finite sentinel meaning "user has explicitly NaN'd this column".
 # We can't store actual NaNs because we use NaN to mean "untouched".
 ERASED_MARKER = -1.0e9
+# Any value below this threshold is treated as the erased sentinel.
+# Legitimate y coordinates are pixel rows and never reach this magnitude.
+ERASED_THRESHOLD = -1.0e8
+
+# Maximum depth of the undo stack.
+UNDO_DEPTH = 50
+
+# Gaussian falloff is truncated past this many sigmas.
+GAUSSIAN_RADIUS_SIGMAS = 3
 
 
 @dataclass
@@ -31,13 +42,26 @@ class _Snapshot:
 
 
 @dataclass
+class _DragSession:
+    name: str
+    x_anchor: int
+    sigma: float
+    single: bool
+    baseline: np.ndarray  # snapshot of effective(name) at begin_drag
+
+
+@dataclass
 class BoundaryEditor:
     width: int
     auto: dict[str, np.ndarray]
     corrected: dict[str, np.ndarray]
     _touched: dict[str, np.ndarray] = field(init=False)
-    _undo: list[_Snapshot] = field(init=False, default_factory=list)
+    _undo: deque = field(
+        init=False,
+        default_factory=lambda: deque(maxlen=UNDO_DEPTH),
+    )
     _dirty: bool = field(init=False, default=False)
+    _drag: Optional[_DragSession] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self._touched = {
@@ -56,13 +80,21 @@ class BoundaryEditor:
         touched = self._touched[name]
         corr = self.corrected[name]
         # Erased columns become NaN; touched-with-value override auto.
-        erased = touched & (corr == ERASED_MARKER)
+        # Use a magnitude threshold instead of float equality to remain
+        # robust against any future arithmetic on `corr`.
+        erased = touched & (corr < ERASED_THRESHOLD)
         moved = touched & ~erased
         out[moved] = corr[moved]
         out[erased] = np.nan
         return out
 
     # ------------------------------------------------------------- mutations
+
+    def _check_name(self, name: str) -> None:
+        if name not in self.auto:
+            raise KeyError(
+                f"Unknown boundary: {name}. Known: {list(self.auto)}"
+            )
 
     def _push_undo(self, name: str) -> None:
         snap = _Snapshot(
@@ -71,34 +103,70 @@ class BoundaryEditor:
             touched=self._touched[name].copy(),
         )
         self._undo.append(snap)
-        # Cap the stack so memory stays bounded.
-        if len(self._undo) > 50:
-            self._undo.pop(0)
 
-    def apply_drag(self, name: str, x: int, y_new: float,
-                    sigma: float = 5.0, single: bool = False) -> None:
-        if x < 0 or x >= self.width:
-            return
+    def begin_drag(self, name: str, x: int, sigma: float = 5.0,
+                   single: bool = False) -> None:
+        """Start a drag session.
+
+        Captures a baseline snapshot of `effective(name)` and pushes a
+        single undo entry. Subsequent `update_drag` calls apply against
+        this baseline (not the current effective value), so repeated
+        updates with the same y do not compound.
+        """
+        self._check_name(name)
+        if not (0 <= x < self.width):
+            raise ValueError(
+                f"x={x} out of range [0, {self.width})"
+            )
         self._push_undo(name)
-        eff = self.effective(name)
-        if single:
-            self._set(name, x, y_new)
+        self._drag = _DragSession(
+            name=name,
+            x_anchor=x,
+            sigma=sigma,
+            single=single,
+            baseline=self.effective(name).copy(),
+        )
+
+    def update_drag(self, y_new: float) -> None:
+        """Apply the new y against the captured baseline (idempotent)."""
+        if self._drag is None:
+            return
+        s = self._drag
+        x = s.x_anchor
+        baseline = s.baseline
+        if s.single:
+            self._set(s.name, x, y_new)
+            self._dirty = True
+            return
+        anchor = baseline[x]
+        if np.isnan(anchor):
+            # Nothing to anchor a delta around — just set this column.
+            self._set(s.name, x, y_new)
         else:
-            current = eff[x]
-            if np.isnan(current):
-                # Nothing to anchor a delta around — just set this column.
-                self._set(name, x, y_new)
-            else:
-                delta = y_new - current
-                radius = int(np.ceil(3 * sigma))
-                for dx in range(-radius, radius + 1):
-                    xx = x + dx
-                    if 0 <= xx < self.width and not np.isnan(eff[xx]):
-                        weight = float(np.exp(-0.5 * (dx / sigma) ** 2))
-                        self._set(name, xx, eff[xx] + delta * weight)
+            delta = y_new - anchor
+            radius = int(np.ceil(GAUSSIAN_RADIUS_SIGMAS * s.sigma))
+            for dx in range(-radius, radius + 1):
+                xx = x + dx
+                if 0 <= xx < self.width and not np.isnan(baseline[xx]):
+                    weight = float(np.exp(-0.5 * (dx / s.sigma) ** 2))
+                    self._set(s.name, xx, baseline[xx] + delta * weight)
         self._dirty = True
 
+    def end_drag(self) -> None:
+        """Finish the drag session; subsequent `update_drag` is a no-op."""
+        self._drag = None
+
+    def apply_drag(self, name: str, x: int, y_new: float,
+                   sigma: float = 5.0, single: bool = False) -> None:
+        """One-shot drag: begin + update + end."""
+        self._check_name(name)
+        x = max(0, min(self.width - 1, x))
+        self.begin_drag(name, x, sigma=sigma, single=single)
+        self.update_drag(y_new)
+        self.end_drag()
+
     def apply_erase(self, name: str, x_start: int, x_end: int) -> None:
+        self._check_name(name)
         x1 = max(0, min(self.width - 1, x_start))
         x2 = max(0, min(self.width - 1, x_end))
         if x1 > x2:
@@ -115,8 +183,13 @@ class BoundaryEditor:
         snap = self._undo.pop()
         self.corrected[snap.name] = snap.corrected
         self._touched[snap.name] = snap.touched
-        # Recompute dirty: any boundary still has touched entries?
-        self._dirty = any(t.any() for t in self._touched.values())
+        # Undo is itself a session-level mutation — keep the dirty flag
+        # monotonic so storage knows to write on save.
+        self._dirty = True
+
+    def mark_clean(self) -> None:
+        """Reset the dirty flag; called by storage after a successful save."""
+        self._dirty = False
 
     # ------------------------------------------------------------- internals
 
