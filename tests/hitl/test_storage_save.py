@@ -96,3 +96,23 @@ def test_save_uses_ERASED_string_for_explicit_nan(temp_xlsx, sample_image_stem):
     df = pd.read_excel(temp_xlsx, sheet_name=sample_image_stem)
     assert df["TOP_y_corrected"].iloc[5] == "ERASED" \
         or df["TOP_y_corrected"].iloc[5] == ERASED_MARKER
+
+
+def test_save_does_not_clobber_corrected_summary_on_empty_snapshots(temp_xlsx, sample_image_stem):
+    # First save creates corrected_summary with a row.
+    wb = load_workbook(temp_xlsx)
+    rec = wb.images[sample_image_stem]
+    width = rec.width
+    corrected = {k: np.full(width, np.nan, dtype=float) for k in AUTO_COLS}
+    corrected["TOP_y"][0] = 99.0
+    snap = CorrectedSnapshot(
+        stem=sample_image_stem, corrected=corrected,
+        timestamp=datetime(2026, 5, 9, 10, 0, 0),
+    )
+    save_corrections(temp_xlsx, [snap], scale_um_per_px_y=3.87)
+
+    # Second save with no snapshots must NOT erase the existing summary.
+    save_corrections(temp_xlsx, [], scale_um_per_px_y=3.87)
+
+    summary = pd.read_excel(temp_xlsx, sheet_name="corrected_summary")
+    assert (summary["filename"] == f"{sample_image_stem}.tif").any()

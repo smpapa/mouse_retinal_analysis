@@ -14,18 +14,31 @@ Memory -> workbook (separate task)
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from openpyxl import load_workbook as _openpyxl_load  # noqa: F401
 
-from src.hitl.boundary_model import ERASED_MARKER  # noqa: F401
+from src.hitl.boundary_model import ERASED_MARKER, ERASED_THRESHOLD
 
 
 AUTO_COLS = ("TOP_y", "ONL_y", "BM_y", "DET_top_y", "DET_bottom_y")
+
+# String literal written to xlsx to represent an erased (explicit-NaN) cell.
+ERASED_CELL_TEXT = "ERASED"
+
+
+def _is_set_cell(v) -> bool:
+    """True if a corrected-column cell holds a user edit (number or ERASED)."""
+    if isinstance(v, str):
+        return v == ERASED_CELL_TEXT
+    try:
+        return not np.isnan(float(v))
+    except (TypeError, ValueError):
+        return False
 
 
 @dataclass
@@ -112,15 +125,22 @@ def save_corrections(path: str | Path,
       - ERASED_MARKER in `corrected` is written as the literal string
         `"ERASED"` so spreadsheets stay human-readable.
       - Append/update a row in `corrected_summary`.
+
+    The write is atomic: we serialize to a sibling `.tmp` file and then
+    `os.replace()` it over the target so a crash mid-write cannot leave
+    the user with a corrupted workbook.
     """
     p = Path(path)
 
-    # Read the whole workbook into memory so we can rewrite it.
-    xls = pd.ExcelFile(p)
-    sheets: dict[str, pd.DataFrame] = {
-        name: pd.read_excel(xls, sheet_name=name)
-        for name in xls.sheet_names
-    }
+    # Read the whole workbook into memory so we can rewrite it. Use a
+    # context manager so the underlying file handle is released before
+    # we open the path for writing (Windows would otherwise raise a
+    # sharing violation).
+    with pd.ExcelFile(p) as xls:
+        sheets: dict[str, pd.DataFrame] = {
+            name: pd.read_excel(xls, sheet_name=name)
+            for name in xls.sheet_names
+        }
 
     summary_rows: list[dict] = []
 
@@ -133,23 +153,18 @@ def save_corrections(path: str | Path,
         any_corrected: dict[str, bool] = {}
         for name, arr in snap.corrected.items():
             corr_col = f"{name}_corrected"
-            # Build a list of cell values: ERASED_MARKER -> "ERASED",
+            # Build a list of cell values: erased -> "ERASED",
             # finite -> number, NaN -> empty.
             cells = []
             for v in arr.tolist():
-                if v == ERASED_MARKER:
-                    cells.append("ERASED")
+                if v < ERASED_THRESHOLD:
+                    cells.append(ERASED_CELL_TEXT)
                 elif np.isnan(v):
                     cells.append(np.nan)
                 else:
                     cells.append(float(v))
             df[corr_col] = cells
-            any_corrected[name] = any(
-                c == "ERASED" or
-                (isinstance(c, (int, float, np.integer, np.floating))
-                 and not (isinstance(c, float) and np.isnan(c)))
-                for c in cells
-            )
+            any_corrected[name] = any(_is_set_cell(c) for c in cells)
 
         # Recompute thicknesses using effective boundary values
         # (auto where no correction, corrected otherwise).
@@ -161,7 +176,7 @@ def save_corrections(path: str | Path,
             corr_raw = df[corr_col].tolist() if corr_col in df.columns else []
             out = auto.copy()
             for i, v in enumerate(corr_raw):
-                if v == "ERASED":
+                if v == ERASED_CELL_TEXT:
                     out[i] = np.nan
                 elif isinstance(v, (int, float, np.integer, np.floating)) \
                         and not (isinstance(v, float) and np.isnan(v)):
@@ -184,10 +199,7 @@ def save_corrections(path: str | Path,
             if corr_col not in df.columns:
                 continue
             for i, v in enumerate(df[corr_col].tolist()):
-                if v == "ERASED" or (
-                    isinstance(v, (int, float, np.integer, np.floating))
-                    and not (isinstance(v, float) and np.isnan(v))
-                ):
+                if _is_set_cell(v):
                     any_per_col[i] = True
         df["corrected_by_user"] = any_per_col
 
@@ -212,19 +224,26 @@ def save_corrections(path: str | Path,
         })
 
     # Merge into / create corrected_summary.
-    if "corrected_summary" in sheets:
-        old = sheets["corrected_summary"]
-        new = pd.DataFrame(summary_rows)
-        # Replace rows for files we just edited, keep others.
-        edited_files = set(r["filename"] for r in summary_rows)
-        if "filename" in old.columns:
-            old = old[~old["filename"].isin(edited_files)]
-        sheets["corrected_summary"] = pd.concat([old, new], ignore_index=True)
-    else:
-        sheets["corrected_summary"] = pd.DataFrame(summary_rows)
+    if summary_rows:
+        if "corrected_summary" in sheets:
+            old = sheets["corrected_summary"]
+            new = pd.DataFrame(summary_rows)
+            # Replace rows for files we just edited, keep others.
+            edited_files = set(r["filename"] for r in summary_rows)
+            if "filename" in old.columns:
+                old = old[~old["filename"].isin(edited_files)]
+            sheets["corrected_summary"] = pd.concat(
+                [old, new], ignore_index=True
+            )
+        else:
+            sheets["corrected_summary"] = pd.DataFrame(summary_rows)
+    # If summary_rows is empty: leave any existing corrected_summary
+    # untouched, and don't create a new (empty) one either.
 
-    # Write all sheets back. ExcelWriter with mode="w" recreates the file
-    # without losing what we already loaded.
-    with pd.ExcelWriter(p, engine="openpyxl", mode="w") as w:
+    # Write all sheets to a temp sibling and atomically replace, so a
+    # crash mid-write cannot corrupt the user's only workbook.
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with pd.ExcelWriter(tmp, engine="openpyxl", mode="w") as w:
         for name, df in sheets.items():
             df.to_excel(w, sheet_name=name, index=False)
+    os.replace(tmp, p)
