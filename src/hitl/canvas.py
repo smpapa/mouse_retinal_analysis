@@ -112,10 +112,14 @@ class OverlayCanvas(QGraphicsView):
     def set_image(self, image: np.ndarray, offset_x: int = 0) -> None:
         """Display a numpy uint8 image (HxW or HxWx3) as the canvas backdrop.
 
-        ``offset_x`` is the B-scan panel's ``left_x`` in the source TIFF.
-        The pixmap is positioned at scene x=offset_x, so boundary arrays
-        (which are B-scan-local, 0..width) are drawn at scene x =
-        x_local + offset_x and overlay the correct region.
+        ``offset_x`` is the B-scan panel's ``left_x`` in the source TIFF
+        (image coordinate where the panel begins; the IR fundus lives to
+        its left). It is used purely as the offset to add to B-scan-local
+        boundary x indices when mapping them onto the pixmap.
+
+        The pixmap itself is placed at scene origin (0, 0) so the IR fundus
+        and the B-scan panel both occupy their natural positions in the
+        TIFF — the pixmap is the source TIFF unmodified.
         """
         if image.ndim == 2:
             h, w = image.shape
@@ -139,10 +143,10 @@ class OverlayCanvas(QGraphicsView):
         else:
             self._pixmap_item.setPixmap(pixmap)
         self._image_offset_x = int(offset_x)
-        self._pixmap_item.setPos(float(self._image_offset_x), 0.0)
-        # Include the scene region to the left of the B-scan (where the IR
-        # fundus lives in the source TIFF) so a future caller can pan to it.
-        self._scene.setSceneRect(0, 0, self._image_offset_x + w, h)
+        # Pixmap at scene (0, 0). offset_x is *not* a position; it is the
+        # boundary coordinate offset (panel start) inside the pixmap.
+        self._pixmap_item.setPos(0.0, 0.0)
+        self._scene.setSceneRect(0, 0, w, h)
         self._refresh_lines()
 
     def set_editor(self, editor: BoundaryEditor) -> None:
