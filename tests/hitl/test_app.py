@@ -148,3 +148,20 @@ def test_mainwindow_boundary_toggle_hides_canvas_line(qtbot, tmp_path,
     assert win.canvas.boundary_visible("TOP_y") is False
     # Other boundaries still visible.
     assert win.canvas.boundary_visible("ONL_y") is True
+
+
+def test_mainwindow_select_image_sets_panel_geometry(qtbot, tmp_path,
+                                                     oct_results_xlsx,
+                                                     sample_image_stem):
+    """MainWindow should pass the OctImage layout into the canvas so
+    boundary lines clip to the B-scan panel and start/center/end markers
+    appear, matching the automatic overlay PNG."""
+    dst = tmp_path / "oct_results.xlsx"
+    shutil.copy(oct_results_xlsx, dst)
+    win = MainWindow(workbook_path=dst, image_dir=oct_results_xlsx.parent.parent)
+    qtbot.addWidget(win)
+    win.select_image(sample_image_stem)
+    assert win.canvas._panel_left_x is not None
+    assert win.canvas._panel_right_x is not None
+    assert win.canvas._panel_left_x < win.canvas._panel_right_x
+    assert len(win.canvas._panel_marker_items) == 3

@@ -227,6 +227,13 @@ class MainWindow(QMainWindow):
                 corrected={k: v.copy() for k, v in rec.corrected.items()},
             )
         self.canvas.set_image(img.rgb, offset_x=img.layout.left_x)
+        self.canvas.set_panel_geometry(
+            left_x=img.layout.left_x,
+            right_x=img.layout.right_x,
+            top_y=img.layout.top_y,
+            bot_y=img.layout.bot_y,
+            center_x=img.layout.center_x,
+        )
         self.canvas.set_editor(self._editors[stem])
         self.canvas.set_active_boundary("TOP_y")
         self._refresh_status()

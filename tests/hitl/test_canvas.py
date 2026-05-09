@@ -123,3 +123,55 @@ def test_canvas_set_boundary_visible_hides_line(qtbot, editor):
     assert canvas.boundary_visible("TOP_y") is False
     # Unknown name is a no-op.
     canvas.set_boundary_visible("not_a_boundary", False)
+
+
+def test_canvas_set_panel_geometry_draws_three_markers(qtbot, editor):
+    img = np.zeros((300, 200, 3), dtype=np.uint8)
+    canvas = OverlayCanvas()
+    qtbot.addWidget(canvas)
+    canvas.set_image(img)
+    canvas.set_editor(editor)
+    canvas.set_panel_geometry(
+        left_x=20, right_x=180, top_y=10, bot_y=290, center_x=100,
+    )
+    # 3 markers (left edge / right edge / center).
+    assert len(canvas._panel_marker_items) == 3
+    assert canvas._panel_left_x == 20
+    assert canvas._panel_right_x == 180
+
+
+def test_canvas_panel_geometry_clips_boundary_path(qtbot, editor):
+    """Boundary array values outside the panel x range are not drawn."""
+    img = np.zeros((300, 200, 3), dtype=np.uint8)
+    canvas = OverlayCanvas()
+    qtbot.addWidget(canvas)
+    canvas.set_image(img)
+    canvas.set_editor(editor)
+    # Panel is the right half of the editor's 200 cols.
+    canvas.set_panel_geometry(
+        left_x=100, right_x=199, top_y=10, bot_y=290, center_x=150,
+    )
+    canvas._refresh_lines()
+    # Build the path that _array_to_path would produce for the active line.
+    arr = editor.effective("TOP_y")
+    path = canvas._array_to_path(arr)
+    # Path bounding rect should start at or after panel left.
+    rect = path.boundingRect()
+    assert rect.left() >= 100
+    assert rect.right() <= 200  # right_x + 1 = 200
+
+
+def test_canvas_set_panel_geometry_replaces_old_markers(qtbot, editor):
+    img = np.zeros((300, 200, 3), dtype=np.uint8)
+    canvas = OverlayCanvas()
+    qtbot.addWidget(canvas)
+    canvas.set_image(img)
+    canvas.set_editor(editor)
+    canvas.set_panel_geometry(left_x=10, right_x=100, top_y=10, bot_y=290, center_x=55)
+    first_items = list(canvas._panel_marker_items)
+    canvas.set_panel_geometry(left_x=20, right_x=180, top_y=10, bot_y=290, center_x=100)
+    # Second call should have replaced (not appended) the marker items.
+    assert len(canvas._panel_marker_items) == 3
+    # No old item should be in the new list.
+    for old in first_items:
+        assert old not in canvas._panel_marker_items

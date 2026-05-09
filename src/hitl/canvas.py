@@ -31,6 +31,7 @@ from PySide6.QtGui import (
     QWheelEvent,
 )
 from PySide6.QtWidgets import (
+    QGraphicsLineItem,
     QGraphicsPathItem,
     QGraphicsPixmapItem,
     QGraphicsScene,
@@ -86,6 +87,12 @@ class OverlayCanvas(QGraphicsView):
         # Scene-x offset of the displayed B-scan image. Boundary arrays are
         # B-scan-local (0..width); add this to map to scene coordinates.
         self._image_offset_x: int = 0
+        # B-scan panel x range. When set, boundary lines are clipped to
+        # [left_x, right_x] (so they do not bleed onto the IR fundus area)
+        # and three vertical marker lines mirror the automatic overlay.
+        self._panel_left_x: Optional[int] = None
+        self._panel_right_x: Optional[int] = None
+        self._panel_marker_items: list[QGraphicsLineItem] = []
 
         self.editor: Optional[BoundaryEditor] = None
         self._active: Optional[str] = None
@@ -352,11 +359,21 @@ class OverlayCanvas(QGraphicsView):
         path = QPainterPath()
         prev_valid = False
         offset = self._image_offset_x
+        left = self._panel_left_x
+        right = self._panel_right_x
         for x_local, y in enumerate(arr):
             if np.isnan(y):
                 prev_valid = False
                 continue
             x = x_local + offset + 0.5
+            # Clip to panel x range when defined so boundary lines do not
+            # bleed onto the IR fundus area on the left.
+            if left is not None and x < left:
+                prev_valid = False
+                continue
+            if right is not None and x > right + 1:
+                prev_valid = False
+                continue
             yf = float(y) + 0.5
             if not prev_valid:
                 path.moveTo(x, yf)
@@ -364,3 +381,43 @@ class OverlayCanvas(QGraphicsView):
             else:
                 path.lineTo(x, yf)
         return path
+
+    def set_panel_geometry(self, left_x: int, right_x: int,
+                           top_y: int, bot_y: int, center_x: int) -> None:
+        """Mark the B-scan panel range and draw start/center/end markers.
+
+        Boundary line rendering is clipped to ``[left_x, right_x]`` so the
+        lines do not bleed onto the IR fundus area. Three vertical marker
+        lines are drawn (red solid for left/right edges, yellow dashed for
+        the geometric center) to mirror the automatic overlay PNG.
+        """
+        self._panel_left_x = int(left_x)
+        self._panel_right_x = int(right_x)
+        # Remove any previous marker items.
+        for item in self._panel_marker_items:
+            self._scene.removeItem(item)
+        self._panel_marker_items.clear()
+        # Edge markers: solid red lines (matches viz.COLOR_BSCAN_EDGE).
+        edge_pen = QPen(QColor(255, 80, 80))
+        edge_pen.setWidthF(1.5)
+        edge_pen.setCosmetic(True)
+        # Center marker: dashed yellow line (matches viz.COLOR_CENTER).
+        center_pen = QPen(QColor(255, 255, 0))
+        center_pen.setWidthF(1.5)
+        center_pen.setCosmetic(True)
+        center_pen.setStyle(Qt.DashLine)
+        for x, pen in (
+            (int(left_x), edge_pen),
+            (int(right_x), edge_pen),
+            (int(center_x), center_pen),
+        ):
+            item = self._scene.addLine(
+                float(x) + 0.5, float(top_y),
+                float(x) + 0.5, float(bot_y),
+                pen,
+            )
+            # Below the boundary line items (z=10).
+            item.setZValue(5)
+            self._panel_marker_items.append(item)
+        # Re-clip existing boundary lines.
+        self._refresh_lines()
