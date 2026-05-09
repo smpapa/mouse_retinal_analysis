@@ -25,11 +25,13 @@ from PySide6.QtGui import (
     QColor,
     QImage,
     QMouseEvent,
+    QPainterPath,
     QPen,
     QPixmap,
     QWheelEvent,
 )
 from PySide6.QtWidgets import (
+    QGraphicsPathItem,
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsView,
@@ -71,7 +73,10 @@ class OverlayCanvas(QGraphicsView):
         self.setMouseTracking(True)
 
         self._pixmap_item: Optional[QGraphicsPixmapItem] = None
-        self._line_items: dict[str, list] = {}
+        # One QGraphicsPathItem per boundary, reused across refreshes via
+        # setPath. Avoids re-creating thousands of QGraphicsLineItems on
+        # every drag mousemove.
+        self._line_items: dict[str, QGraphicsPathItem] = {}
         # Scene-x offset of the displayed B-scan image. Boundary arrays are
         # B-scan-local (0..width); add this to map to scene coordinates.
         self._image_offset_x: int = 0
@@ -122,10 +127,13 @@ class OverlayCanvas(QGraphicsView):
             self._pixmap_item.setPixmap(pixmap)
         self._image_offset_x = int(offset_x)
         self._pixmap_item.setPos(float(self._image_offset_x), 0.0)
-        self._scene.setSceneRect(self._image_offset_x, 0, w, h)
+        # Include the scene region to the left of the B-scan (where the IR
+        # fundus lives in the source TIFF) so a future caller can pan to it.
+        self._scene.setSceneRect(0, 0, self._image_offset_x + w, h)
         self._refresh_lines()
 
     def set_editor(self, editor: BoundaryEditor) -> None:
+        self._cancel_drag_if_any()
         self.editor = editor
         self._refresh_lines()
 
@@ -134,7 +142,18 @@ class OverlayCanvas(QGraphicsView):
         self._refresh_lines()
 
     def set_mode(self, mode: EditMode) -> None:
+        self._cancel_drag_if_any()
         self._mode = mode
+
+    def _cancel_drag_if_any(self) -> None:
+        """Cleanly close any in-progress drag/pan so external state changes are safe."""
+        if self._dragging and self.editor is not None and self._mode is EditMode.DRAG:
+            self.editor.end_drag()
+        self._dragging = False
+        if self._panning:
+            self.unsetCursor()
+            self._panning = False
+            self._pan_last_pos = None
 
     # --------------------------------------------------------- headless hooks
 
@@ -162,7 +181,14 @@ class OverlayCanvas(QGraphicsView):
     # --------------------------------------------------------- mouse handling
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        # We treat one gesture at a time. The first button down wins until
+        # released — a second button while another is active is ignored.
         if event.button() == Qt.RightButton:
+            if self._dragging:
+                # Left-drag is in flight; ignore right-button to keep one
+                # gesture active at a time.
+                event.accept()
+                return
             # Right-click drag pans the view. Track manually so we don't
             # interfere with the left-button drag/erase flow.
             self._panning = True
@@ -173,6 +199,11 @@ class OverlayCanvas(QGraphicsView):
         if (event.button() == Qt.LeftButton
                 and self.editor is not None
                 and self._active is not None):
+            if self._panning:
+                # Pan is in flight; ignore left-button until the right
+                # button is released.
+                event.accept()
+                return
             scene_pt = self.mapToScene(event.position().toPoint())
             # Convert scene x to B-scan-local x by subtracting the offset.
             x = int(round(scene_pt.x() - self._image_offset_x))
@@ -261,45 +292,47 @@ class OverlayCanvas(QGraphicsView):
 
     # ------------------------------------------------------------- rendering
 
-    def _clear_lines(self) -> None:
-        for items in self._line_items.values():
-            for item in items:
-                self._scene.removeItem(item)
-        self._line_items = {}
-
     def _refresh_lines(self) -> None:
-        """Redraw all boundary line segments from the editor's effective values."""
-        self._clear_lines()
+        """Update each boundary's QGraphicsPathItem to match the editor."""
         if self.editor is None:
             return
-        for name in self.editor.auto.keys():
+        for name in COLORS:
+            if name not in self.editor.auto:
+                continue
             arr = self.editor.effective(name)
-            color = COLORS.get(name, (255, 255, 255))
-            pen_width = (
-                ACTIVE_LINE_WIDTH if name == self._active else LINE_WIDTH
-            )
-            pen = QPen()
-            pen.setColor(QColor(*color))
-            pen.setWidth(pen_width)
-            pen.setCosmetic(True)
-            items = []
-            # Draw connected line segments between adjacent finite points.
-            # Boundary x is B-scan-local; add image offset to map to scene.
-            offset = self._image_offset_x
-            prev_x: Optional[int] = None
-            prev_y: Optional[float] = None
-            for x in range(arr.shape[0]):
-                y = arr[x]
-                if np.isnan(y):
-                    prev_x = None
-                    prev_y = None
-                    continue
-                if prev_x is not None and prev_y is not None:
-                    item = self._scene.addLine(
-                        prev_x + 0.5 + offset, prev_y,
-                        x + 0.5 + offset, float(y), pen,
-                    )
-                    items.append(item)
-                prev_x = x
-                prev_y = float(y)
-            self._line_items[name] = items
+            path = self._array_to_path(arr)
+            item = self._line_items.get(name)
+            if item is None:
+                r, g, b = COLORS[name]
+                item = QGraphicsPathItem(path)
+                pen = QPen(QColor(r, g, b))
+                pen.setWidthF(LINE_WIDTH)
+                pen.setCosmetic(True)
+                item.setPen(pen)
+                item.setZValue(10)
+                self._scene.addItem(item)
+                self._line_items[name] = item
+            else:
+                item.setPath(path)
+            # Active boundary gets a thicker pen.
+            is_active = (name == self._active)
+            pen = item.pen()
+            pen.setWidthF(ACTIVE_LINE_WIDTH if is_active else LINE_WIDTH)
+            item.setPen(pen)
+
+    def _array_to_path(self, arr: np.ndarray) -> QPainterPath:
+        path = QPainterPath()
+        prev_valid = False
+        offset = self._image_offset_x
+        for x_local, y in enumerate(arr):
+            if np.isnan(y):
+                prev_valid = False
+                continue
+            x = x_local + offset + 0.5
+            yf = float(y) + 0.5
+            if not prev_valid:
+                path.moveTo(x, yf)
+                prev_valid = True
+            else:
+                path.lineTo(x, yf)
+        return path

@@ -71,3 +71,41 @@ def test_canvas_set_image_accepts_offset_x(qtbot, editor):
     canvas.set_editor(editor)
     # Should not raise; offset_x is accepted as a kwarg.
     assert canvas._image_offset_x == 200
+
+
+def test_canvas_set_mode_during_drag_cancels_cleanly(qtbot, editor):
+    img = np.zeros((300, 200, 3), dtype=np.uint8)
+    canvas = OverlayCanvas()
+    qtbot.addWidget(canvas)
+    canvas.set_image(img)
+    canvas.set_editor(editor)
+    canvas.set_active_boundary("TOP_y")
+    canvas.set_mode(EditMode.DRAG)
+    # Manually start a drag session (mimics mousePressEvent without a real event)
+    editor.begin_drag("TOP_y", 50, sigma=5.0)
+    canvas._dragging = True
+    canvas.set_mode(EditMode.ERASE)  # must cleanly close the drag
+    assert canvas._dragging is False
+    # Editor is now in a clean state — apply_drag should work without error.
+    editor.apply_drag("TOP_y", 60, 40.0)
+    assert editor.effective("TOP_y")[60] == pytest.approx(40.0)
+
+
+def test_canvas_set_editor_during_drag_cancels_cleanly(qtbot, editor):
+    img = np.zeros((300, 200, 3), dtype=np.uint8)
+    canvas = OverlayCanvas()
+    qtbot.addWidget(canvas)
+    canvas.set_image(img)
+    canvas.set_editor(editor)
+    canvas.set_active_boundary("TOP_y")
+    canvas.set_mode(EditMode.DRAG)
+    editor.begin_drag("TOP_y", 50, sigma=5.0)
+    canvas._dragging = True
+    # Swap to a fresh editor — old editor's drag session must be ended first.
+    width = 200
+    auto = {k: np.full(width, 80.0) for k in editor.auto}
+    corrected = {k: np.full(width, np.nan) for k in editor.auto}
+    new_ed = type(editor)(width=width, auto=auto, corrected=corrected)
+    canvas.set_editor(new_ed)
+    assert canvas._dragging is False
+    assert canvas.editor is new_ed
