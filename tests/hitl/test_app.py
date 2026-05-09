@@ -39,3 +39,51 @@ def test_mainwindow_save_persists_corrections(qtbot, tmp_path,
     win.save_current_image()
     df = pd.read_excel(dst, sheet_name=sample_image_stem)
     assert df["TOP_y_corrected"].iloc[0] == pytest.approx(99.0)
+
+
+def test_mainwindow_undo_reverts_edit(qtbot, tmp_path, oct_results_xlsx,
+                                      sample_image_stem):
+    dst = tmp_path / "oct_results.xlsx"
+    shutil.copy(oct_results_xlsx, dst)
+    win = MainWindow(workbook_path=dst,
+                     image_dir=oct_results_xlsx.parent.parent)
+    qtbot.addWidget(win)
+    win.select_image(sample_image_stem)
+    editor = win._editors[sample_image_stem]
+    before = editor.effective("TOP_y").copy()
+    win.canvas.set_active_boundary("TOP_y")
+    win.canvas.simulate_drag_to(x=0, y=99.0)
+    assert editor.effective("TOP_y")[0] == pytest.approx(99.0)
+    win._undo()
+    assert np.allclose(editor.effective("TOP_y"), before, equal_nan=True)
+
+
+def test_mainwindow_arrow_keys_navigate(qtbot, tmp_path, oct_results_xlsx):
+    dst = tmp_path / "oct_results.xlsx"
+    shutil.copy(oct_results_xlsx, dst)
+    win = MainWindow(workbook_path=dst,
+                     image_dir=oct_results_xlsx.parent.parent)
+    qtbot.addWidget(win)
+    win.show()
+    win.sidebar.setCurrentRow(0)
+    first_stem = win.sidebar._stem_for_row[0]
+    second_stem = win.sidebar._stem_for_row[1]
+    assert win._current_stem == first_stem
+    win._next_image()
+    assert win._current_stem == second_stem
+    win._prev_image()
+    assert win._current_stem == first_stem
+
+
+def test_mainwindow_drag_action_mutually_exclusive_with_erase(qtbot, tmp_path,
+                                                              oct_results_xlsx):
+    dst = tmp_path / "oct_results.xlsx"
+    shutil.copy(oct_results_xlsx, dst)
+    win = MainWindow(workbook_path=dst,
+                     image_dir=oct_results_xlsx.parent.parent)
+    qtbot.addWidget(win)
+    # Start with drag checked
+    assert win.act_drag.isChecked() is True
+    win.act_erase.trigger()
+    assert win.act_erase.isChecked() is True
+    assert win.act_drag.isChecked() is False

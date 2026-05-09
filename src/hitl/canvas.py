@@ -20,7 +20,7 @@ from enum import Enum
 from typing import Optional
 
 import numpy as np
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QImage,
@@ -64,6 +64,10 @@ DRAG_SIGMA = 5.0
 
 class OverlayCanvas(QGraphicsView):
     """Image canvas with overlaid editable boundary lines."""
+
+    # Emitted after a user edit completes (drag end or erase apply) so
+    # external observers (e.g. the main window status bar) can refresh.
+    edit_finished = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -145,6 +149,10 @@ class OverlayCanvas(QGraphicsView):
         self._cancel_drag_if_any()
         self._mode = mode
 
+    def refresh(self) -> None:
+        """Public re-render hook for callers that mutated the editor externally."""
+        self._refresh_lines()
+
     def _cancel_drag_if_any(self) -> None:
         """Cleanly close any in-progress drag/pan so external state changes are safe."""
         if self._dragging and self.editor is not None and self._mode is EditMode.DRAG:
@@ -171,12 +179,14 @@ class OverlayCanvas(QGraphicsView):
             sigma=DRAG_SIGMA, single=single,
         )
         self._refresh_lines()
+        self.edit_finished.emit()
 
     def simulate_erase(self, x_start: int, x_end: int) -> None:
         if self.editor is None or self._active is None:
             return
         self.editor.apply_erase(self._active, int(x_start), int(x_end))
         self._refresh_lines()
+        self.edit_finished.emit()
 
     # --------------------------------------------------------- mouse handling
 
@@ -275,6 +285,7 @@ class OverlayCanvas(QGraphicsView):
             self._erase_start_x = None
             self._erase_last_x = None
             self._refresh_lines()
+            self.edit_finished.emit()
             return
         super().mouseReleaseEvent(event)
 

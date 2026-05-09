@@ -7,9 +7,9 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (QApplication, QDockWidget, QMainWindow,
-                                QStatusBar, QToolBar)
+                                QMessageBox, QStatusBar, QToolBar)
 
 # Make sibling analysis modules importable.
 SRC = Path(__file__).resolve().parents[1]
@@ -18,12 +18,16 @@ if str(SRC) not in sys.path:
 
 from io_utils import load_oct                                       # noqa: E402
 
-from .boundary_model import BoundaryEditor                          # noqa: E402
+from .boundary_model import BoundaryEditor, ERASED_THRESHOLD        # noqa: E402
 from .canvas import EditMode, OverlayCanvas                         # noqa: E402
 from .overlay_render import render_corrected_overlay                # noqa: E402
 from .sidebar import FileEntry, FileListView                        # noqa: E402
 from .storage import (CorrectedSnapshot, Workbook,
-                      load_workbook, save_corrections, AUTO_COLS)   # noqa: E402
+                      load_workbook, save_corrections)              # noqa: E402
+
+
+# Boundary names in display order; used for status bar "edited:" summary.
+_BOUNDARY_NAMES = ("TOP_y", "ONL_y", "BM_y", "DET_top_y", "DET_bottom_y")
 
 
 class MainWindow(QMainWindow):
@@ -35,6 +39,9 @@ class MainWindow(QMainWindow):
         self._wb: Workbook | None = None
         self._current_stem: str | None = None
         self._scale_y = 3.87  # default; overridden if summary has it.
+        # When True, _on_sidebar_image_selected skips the unsaved-changes
+        # prompt — used for programmatic reverts after the user cancels.
+        self._suppress_dirty_check: bool = False
 
         self._build_ui()
         self._reload_workbook()
@@ -42,10 +49,13 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         self.setWindowTitle("OCT HITL Editor")
         self.canvas = OverlayCanvas()
+        self.canvas.edit_finished.connect(self._refresh_status)
         self.setCentralWidget(self.canvas)
 
         self.sidebar = FileListView()
-        self.sidebar.image_selected.connect(self.select_image)
+        # Route through the dirty-check handler instead of select_image
+        # directly so we can prompt before discarding unsaved edits.
+        self.sidebar.image_selected.connect(self._on_sidebar_image_selected)
         dock = QDockWidget("Files", self)
         dock.setWidget(self.sidebar)
         dock.setAllowedAreas(Qt.LeftDockWidgetArea)
@@ -63,6 +73,11 @@ class MainWindow(QMainWindow):
         self.act_erase.setCheckable(True)
         self.act_erase.triggered.connect(
             lambda: self.canvas.set_mode(EditMode.ERASE))
+        # Mutually exclusive selection between drag and erase.
+        mode_group = QActionGroup(self)
+        mode_group.setExclusive(True)
+        mode_group.addAction(self.act_drag)
+        mode_group.addAction(self.act_erase)
         toolbar.addAction(self.act_drag)
         toolbar.addAction(self.act_erase)
 
@@ -77,18 +92,49 @@ class MainWindow(QMainWindow):
         self.act_save.triggered.connect(self.save_current_image)
         toolbar.addAction(self.act_save)
 
-        self._setup_boundary_shortcuts()
+        self._setup_shortcuts()
         self.setStatusBar(QStatusBar(self))
 
-    def _setup_boundary_shortcuts(self) -> None:
+    def _setup_shortcuts(self) -> None:
+        # Boundary picker shortcuts: 1..5 select active boundary.
         keys = ["1", "2", "3", "4", "5"]
-        names = ["TOP_y", "ONL_y", "BM_y", "DET_top_y", "DET_bottom_y"]
-        for k, name in zip(keys, names):
+        for k, name in zip(keys, _BOUNDARY_NAMES):
             act = QAction(self)
             act.setShortcut(QKeySequence(k))
             act.triggered.connect(lambda _=False, n=name:
                                   self.canvas.set_active_boundary(n))
             self.addAction(act)
+
+        # Mode shortcuts: D = drag, E = erase. Trigger the action so the
+        # checked state in the QActionGroup updates alongside the mode.
+        act_d = QAction(self)
+        act_d.setShortcut(QKeySequence("D"))
+        act_d.triggered.connect(self._activate_drag_mode)
+        self.addAction(act_d)
+
+        act_e = QAction(self)
+        act_e.setShortcut(QKeySequence("E"))
+        act_e.triggered.connect(self._activate_erase_mode)
+        self.addAction(act_e)
+
+        # Image navigation: Left/Right arrows step through the sidebar.
+        act_prev = QAction(self)
+        act_prev.setShortcut(QKeySequence(Qt.Key_Left))
+        act_prev.triggered.connect(self._prev_image)
+        self.addAction(act_prev)
+
+        act_next = QAction(self)
+        act_next.setShortcut(QKeySequence(Qt.Key_Right))
+        act_next.triggered.connect(self._next_image)
+        self.addAction(act_next)
+
+    def _activate_drag_mode(self) -> None:
+        self.canvas.set_mode(EditMode.DRAG)
+        self.act_drag.setChecked(True)
+
+    def _activate_erase_mode(self) -> None:
+        self.canvas.set_mode(EditMode.ERASE)
+        self.act_erase.setChecked(True)
 
     def _reload_workbook(self) -> None:
         self._wb = load_workbook(self.workbook_path)
@@ -108,6 +154,45 @@ class MainWindow(QMainWindow):
         entries.sort(key=lambda e: e.stem)
         self.sidebar.set_entries(entries)
 
+    def _on_sidebar_image_selected(self, stem: str) -> None:
+        """Sidebar selection handler with unsaved-changes confirmation.
+
+        If the previously-selected image has dirty edits, prompt the user
+        to save / discard / cancel before switching. On cancel, revert
+        the sidebar selection without re-prompting.
+        """
+        if self._suppress_dirty_check:
+            self.select_image(stem)
+            return
+        prev = self._current_stem
+        if (prev is not None
+                and prev != stem
+                and self._editors.get(prev) is not None
+                and self._editors[prev].dirty):
+            current_filename = (self._wb.images[prev].filename
+                                if self._wb is not None else prev)
+            reply = QMessageBox.question(
+                self, "Unsaved changes",
+                f"Save changes to {current_filename} before switching?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if reply == QMessageBox.Cancel:
+                # Revert sidebar selection back to the previous stem
+                # without re-firing the dirty prompt.
+                self._suppress_dirty_check = True
+                try:
+                    if prev in self.sidebar._stem_for_row:
+                        row = self.sidebar._stem_for_row.index(prev)
+                        self.sidebar.setCurrentRow(row)
+                finally:
+                    self._suppress_dirty_check = False
+                return
+            if reply == QMessageBox.Save:
+                self.save_current_image()
+            # Discard: fall through and load the new image.
+        self.select_image(stem)
+
     def select_image(self, stem: str) -> None:
         if self._wb is None or stem not in self._wb.images:
             return
@@ -124,7 +209,7 @@ class MainWindow(QMainWindow):
         self.canvas.set_image(img.rgb, offset_x=img.layout.left_x)
         self.canvas.set_editor(self._editors[stem])
         self.canvas.set_active_boundary("TOP_y")
-        self.statusBar().showMessage(f"{rec.filename} | {rec.width} cols")
+        self._refresh_status()
 
     def save_current_image(self) -> None:
         if self._current_stem is None:
@@ -137,15 +222,25 @@ class MainWindow(QMainWindow):
         )
         save_corrections(self.workbook_path, [snap],
                          scale_um_per_px_y=self._scale_y)
-        # Render the corrected overlay PNG.
-        rec = self._wb.images[self._current_stem]
-        img_path = self.image_dir / rec.filename
-        out_path = (self.workbook_path.parent /
-                    f"{self._current_stem}_overlay_corrected.png")
-        boundaries = {k: editor.effective(k) for k in editor.auto}
-        render_corrected_overlay(img_path, boundaries, out_path)
+        # Sidebar marker reflects xlsx state immediately.
         self.sidebar.mark_corrected(self._current_stem, True)
         editor.mark_clean()
+        self._refresh_status()
+        # Render PNG separately — failure is non-fatal so the user does
+        # not lose their save state if rendering hits an edge case.
+        # Note: self._wb may go slightly stale after save; full reload
+        # only on next app launch.
+        rec = self._wb.images[self._current_stem]
+        try:
+            img_path = self.image_dir / rec.filename
+            out_path = (self.workbook_path.parent /
+                        f"{self._current_stem}_overlay_corrected.png")
+            boundaries = {k: editor.effective(k) for k in editor.auto}
+            render_corrected_overlay(img_path, boundaries, out_path)
+        except Exception as e:
+            self.statusBar().showMessage(
+                f"Saved {rec.filename} (overlay PNG failed: {e})")
+            return
         self.statusBar().showMessage(f"Saved {rec.filename}")
 
     def _undo(self) -> None:
@@ -153,7 +248,55 @@ class MainWindow(QMainWindow):
             return
         editor = self._editors[self._current_stem]
         editor.undo()
-        self.canvas._refresh_lines()
+        self.canvas.refresh()
+        self._refresh_status()
+
+    def _prev_image(self) -> None:
+        """Move sidebar selection up by one (clamped)."""
+        count = self.sidebar.count()
+        if count == 0:
+            return
+        row = self.sidebar.currentRow()
+        new_row = max(0, row - 1)
+        if new_row != row:
+            self.sidebar.setCurrentRow(new_row)
+
+    def _next_image(self) -> None:
+        """Move sidebar selection down by one (clamped)."""
+        count = self.sidebar.count()
+        if count == 0:
+            return
+        row = self.sidebar.currentRow()
+        new_row = min(count - 1, row + 1)
+        if new_row != row:
+            self.sidebar.setCurrentRow(new_row)
+
+    def _refresh_status(self) -> None:
+        """Rebuild the status bar message with edited boundaries + dirty marker."""
+        if self._current_stem is None or self._wb is None:
+            return
+        if self._current_stem not in self._wb.images:
+            return
+        rec = self._wb.images[self._current_stem]
+        editor = self._editors.get(self._current_stem)
+        if editor is None:
+            return
+        edited: list[str] = []
+        for name in _BOUNDARY_NAMES:
+            if name not in editor.corrected:
+                continue
+            corr = editor.corrected[name]
+            # "touched" = any column either set to a finite override or
+            # explicitly erased (sentinel below threshold).
+            touched = bool(np.any((~np.isnan(corr)) | (corr < ERASED_THRESHOLD)))
+            if touched:
+                edited.append(name.replace("_y", ""))
+        parts = [rec.filename, f"{rec.width} cols"]
+        if edited:
+            parts.append("edited: " + ", ".join(edited))
+        if editor.dirty:
+            parts.append("●")
+        self.statusBar().showMessage(" | ".join(parts))
 
 
 def run(workbook_path, image_dir) -> None:
