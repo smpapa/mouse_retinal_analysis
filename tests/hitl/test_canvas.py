@@ -61,3 +61,13 @@ def test_canvas_erase_delegates_to_editor(qtbot, editor):
     canvas.simulate_erase(x_start=10, x_end=20)
     eff = editor.effective("BM_y")
     assert np.all(np.isnan(eff[10:21]))
+
+
+def test_canvas_set_image_accepts_offset_x(qtbot, editor):
+    img = np.zeros((300, 200, 3), dtype=np.uint8)
+    canvas = OverlayCanvas()
+    qtbot.addWidget(canvas)
+    canvas.set_image(img, offset_x=200)
+    canvas.set_editor(editor)
+    # Should not raise; offset_x is accepted as a kwarg.
+    assert canvas._image_offset_x == 200
