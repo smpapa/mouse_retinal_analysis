@@ -15,10 +15,14 @@ Memory -> workbook (separate task)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from openpyxl import load_workbook as _openpyxl_load  # noqa: F401
+
+from src.hitl.boundary_model import ERASED_MARKER  # noqa: F401
 
 
 AUTO_COLS = ("TOP_y", "ONL_y", "BM_y", "DET_top_y", "DET_bottom_y")
@@ -88,3 +92,139 @@ def load_workbook(path: str | Path) -> Workbook:
                 rec.corrected[name] = np.full(width, np.nan, dtype=float)
         wb.images[stem] = rec
     return wb
+
+
+@dataclass
+class CorrectedSnapshot:
+    stem: str
+    corrected: dict[str, np.ndarray]
+    timestamp: datetime
+
+
+def save_corrections(path: str | Path,
+                     snapshots: list[CorrectedSnapshot],
+                     scale_um_per_px_y: float) -> None:
+    """Write user corrections to the workbook.
+
+    For each snapshot:
+      - Update the per-image sheet with `<name>_corrected` columns and
+        the recomputed thickness columns.
+      - ERASED_MARKER in `corrected` is written as the literal string
+        `"ERASED"` so spreadsheets stay human-readable.
+      - Append/update a row in `corrected_summary`.
+    """
+    p = Path(path)
+
+    # Read the whole workbook into memory so we can rewrite it.
+    xls = pd.ExcelFile(p)
+    sheets: dict[str, pd.DataFrame] = {
+        name: pd.read_excel(xls, sheet_name=name)
+        for name in xls.sheet_names
+    }
+
+    summary_rows: list[dict] = []
+
+    for snap in snapshots:
+        if snap.stem not in sheets:
+            continue
+        df = sheets[snap.stem]
+
+        # Apply each boundary's edits.
+        any_corrected: dict[str, bool] = {}
+        for name, arr in snap.corrected.items():
+            corr_col = f"{name}_corrected"
+            # Build a list of cell values: ERASED_MARKER -> "ERASED",
+            # finite -> number, NaN -> empty.
+            cells = []
+            for v in arr.tolist():
+                if v == ERASED_MARKER:
+                    cells.append("ERASED")
+                elif np.isnan(v):
+                    cells.append(np.nan)
+                else:
+                    cells.append(float(v))
+            df[corr_col] = cells
+            any_corrected[name] = any(
+                c == "ERASED" or
+                (isinstance(c, (int, float, np.integer, np.floating))
+                 and not (isinstance(c, float) and np.isnan(c)))
+                for c in cells
+            )
+
+        # Recompute thicknesses using effective boundary values
+        # (auto where no correction, corrected otherwise).
+        eff: dict[str, np.ndarray] = {}
+        for name in AUTO_COLS:
+            auto = df[name].to_numpy(dtype=float) if name in df.columns \
+                else np.full(len(df), np.nan, dtype=float)
+            corr_col = f"{name}_corrected"
+            corr_raw = df[corr_col].tolist() if corr_col in df.columns else []
+            out = auto.copy()
+            for i, v in enumerate(corr_raw):
+                if v == "ERASED":
+                    out[i] = np.nan
+                elif isinstance(v, (int, float, np.integer, np.floating)) \
+                        and not (isinstance(v, float) and np.isnan(v)):
+                    out[i] = float(v)
+            eff[name] = out
+
+        # total = (BM - TOP) * scale, outer = (BM - ONL) * scale,
+        # det = (DET_b - DET_t) * scale
+        df["total_thickness_um_corrected"] = \
+            (eff["BM_y"] - eff["TOP_y"]) * scale_um_per_px_y
+        df["outer_thickness_um_corrected"] = \
+            (eff["BM_y"] - eff["ONL_y"]) * scale_um_per_px_y
+        df["detachment_thickness_um_corrected"] = \
+            (eff["DET_bottom_y"] - eff["DET_top_y"]) * scale_um_per_px_y
+
+        # corrected_by_user flag for the row.
+        any_per_col = np.zeros(len(df), dtype=bool)
+        for name in AUTO_COLS:
+            corr_col = f"{name}_corrected"
+            if corr_col not in df.columns:
+                continue
+            for i, v in enumerate(df[corr_col].tolist()):
+                if v == "ERASED" or (
+                    isinstance(v, (int, float, np.integer, np.floating))
+                    and not (isinstance(v, float) and np.isnan(v))
+                ):
+                    any_per_col[i] = True
+        df["corrected_by_user"] = any_per_col
+
+        sheets[snap.stem] = df
+
+        # Build the summary row.
+        n_corr = int(any_per_col.sum())
+        mean_total = float(np.nanmean(df["total_thickness_um"])) \
+            if "total_thickness_um" in df.columns else float("nan")
+        mean_total_corr = float(np.nanmean(df["total_thickness_um_corrected"]))
+        summary_rows.append({
+            "filename": f"{snap.stem}.tif",
+            "n_corrected_cols": n_corr,
+            "corrected_TOP": bool(any_corrected.get("TOP_y", False)),
+            "corrected_ONL": bool(any_corrected.get("ONL_y", False)),
+            "corrected_BM": bool(any_corrected.get("BM_y", False)),
+            "corrected_DET": bool(any_corrected.get("DET_top_y", False)
+                                  or any_corrected.get("DET_bottom_y", False)),
+            "mean_total_um": mean_total,
+            "mean_total_um_corrected": mean_total_corr,
+            "edit_timestamp": snap.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+    # Merge into / create corrected_summary.
+    if "corrected_summary" in sheets:
+        old = sheets["corrected_summary"]
+        new = pd.DataFrame(summary_rows)
+        # Replace rows for files we just edited, keep others.
+        edited_files = set(r["filename"] for r in summary_rows)
+        if "filename" in old.columns:
+            old = old[~old["filename"].isin(edited_files)]
+        sheets["corrected_summary"] = pd.concat([old, new], ignore_index=True)
+    else:
+        sheets["corrected_summary"] = pd.DataFrame(summary_rows)
+
+    # Write all sheets back. ExcelWriter with mode="w" recreates the file
+    # without losing what we already loaded.
+    with pd.ExcelWriter(p, engine="openpyxl", mode="w") as w:
+        for name, df in sheets.items():
+            df.to_excel(w, sheet_name=name, index=False)
