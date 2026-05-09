@@ -98,9 +98,17 @@ def load_workbook(path: str | Path) -> Workbook:
                 rec.auto[name] = np.full(width, np.nan, dtype=float)
             corr_col = f"{name}_corrected"
             if corr_col in df.columns:
-                rec.corrected[name] = pd.to_numeric(
-                    df[corr_col], errors="coerce"
-                ).to_numpy(dtype=float)
+                # Map literal "ERASED" cells back to ERASED_MARKER so the
+                # sentinel survives save->reload (pd.to_numeric would
+                # otherwise silently coerce it to NaN, indistinguishable
+                # from "untouched").
+                raw = df[corr_col]
+                out = np.full(width, np.nan, dtype=float)
+                nums = pd.to_numeric(raw, errors="coerce").to_numpy(dtype=float)
+                is_erased = raw.astype(str).str.upper() == ERASED_CELL_TEXT
+                out[:] = nums
+                out[is_erased.to_numpy()] = ERASED_MARKER
+                rec.corrected[name] = out
             else:
                 rec.corrected[name] = np.full(width, np.nan, dtype=float)
         wb.images[stem] = rec

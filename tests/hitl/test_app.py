@@ -87,3 +87,49 @@ def test_mainwindow_drag_action_mutually_exclusive_with_erase(qtbot, tmp_path,
     win.act_erase.trigger()
     assert win.act_erase.isChecked() is True
     assert win.act_drag.isChecked() is False
+
+
+def test_mainwindow_close_event_with_dirty_editor_aborts_on_cancel(qtbot, tmp_path,
+                                                                    oct_results_xlsx,
+                                                                    sample_image_stem,
+                                                                    monkeypatch):
+    """closeEvent should ignore the close when user cancels the prompt."""
+    from PySide6.QtWidgets import QMessageBox
+    dst = tmp_path / "oct_results.xlsx"
+    shutil.copy(oct_results_xlsx, dst)
+    win = MainWindow(workbook_path=dst, image_dir=oct_results_xlsx.parent.parent)
+    qtbot.addWidget(win)
+    win.select_image(sample_image_stem)
+    # Make the editor dirty.
+    win.canvas.set_active_boundary("TOP_y")
+    win.canvas.simulate_drag_to(x=0, y=99.0)
+    assert win._editors[sample_image_stem].dirty is True
+
+    # Stub QMessageBox.question to return Cancel.
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *a, **kw: QMessageBox.Cancel))
+
+    from PySide6.QtGui import QCloseEvent
+    ev = QCloseEvent()
+    win.closeEvent(ev)
+    assert not ev.isAccepted()
+
+
+def test_mainwindow_select_image_handles_missing_tiff(qtbot, tmp_path,
+                                                      oct_results_xlsx):
+    """A missing TIFF should set a status message, not crash."""
+    dst = tmp_path / "oct_results.xlsx"
+    shutil.copy(oct_results_xlsx, dst)
+    # Point image_dir at an empty folder so all TIFFs are missing.
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    win = MainWindow(workbook_path=dst, image_dir=empty_dir)
+    qtbot.addWidget(win)
+    # Pick the first image — load_oct will raise FileNotFoundError.
+    first_stem = win.sidebar._stem_for_row[0]
+    win.select_image(first_stem)
+    # Should not have advanced _current_stem to the broken image.
+    assert win._current_stem is None
+    # Status bar should mention the failure.
+    msg = win.statusBar().currentMessage()
+    assert "Could not load" in msg or "could not load" in msg.lower()

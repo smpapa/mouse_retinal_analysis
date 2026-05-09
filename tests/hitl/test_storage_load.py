@@ -27,6 +27,43 @@ def test_load_workbook_loads_corrected_columns_when_present(loaded_workbook):
             assert arr.shape == (rec.width,)
 
 
+def test_load_workbook_preserves_ERASED_sentinel(tmp_path, oct_results_xlsx,
+                                                  sample_image_stem):
+    """Round-trip: save ERASED cells, reload, verify they come back as ERASED_MARKER."""
+    import shutil
+    from datetime import datetime
+    from src.hitl.storage import (load_workbook, save_corrections,
+                                  CorrectedSnapshot, AUTO_COLS, ERASED_MARKER)
+    from src.hitl.boundary_model import ERASED_THRESHOLD
+    import numpy as np
+
+    dst = tmp_path / "oct_results.xlsx"
+    shutil.copy(oct_results_xlsx, dst)
+    wb = load_workbook(dst)
+    rec = wb.images[sample_image_stem]
+    width = rec.width
+    corrected = {k: np.full(width, np.nan, dtype=float) for k in AUTO_COLS}
+    # Erase TOP_y at columns 5..7 inclusive.
+    corrected["TOP_y"][5] = ERASED_MARKER
+    corrected["TOP_y"][6] = ERASED_MARKER
+    corrected["TOP_y"][7] = ERASED_MARKER
+    snap = CorrectedSnapshot(
+        stem=sample_image_stem,
+        corrected=corrected,
+        timestamp=datetime(2026, 5, 9, 12, 0, 0),
+    )
+    save_corrections(dst, [snap], scale_um_per_px_y=3.87)
+    # Reload and verify the sentinel survived.
+    wb2 = load_workbook(dst)
+    rec2 = wb2.images[sample_image_stem]
+    reloaded = rec2.corrected["TOP_y"]
+    for i in (5, 6, 7):
+        assert reloaded[i] < ERASED_THRESHOLD, \
+            f"Column {i} should be ERASED after round-trip; got {reloaded[i]}"
+    # Untouched columns stay NaN.
+    assert np.isnan(reloaded[0])
+
+
 def test_load_workbook_missing_auto_columns_fall_back_to_nan(tmp_path):
     p = tmp_path / "tiny.xlsx"
     summary = pd.DataFrame({"filename": ["dummy.tif"]})

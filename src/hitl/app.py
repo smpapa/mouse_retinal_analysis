@@ -196,16 +196,25 @@ class MainWindow(QMainWindow):
     def select_image(self, stem: str) -> None:
         if self._wb is None or stem not in self._wb.images:
             return
-        self._current_stem = stem
         rec = self._wb.images[stem]
+        img_path = self.image_dir / rec.filename
+        # Load the TIFF first so a missing/corrupt file doesn't leave the
+        # window pointing at a broken image. _current_stem is only updated
+        # after the load succeeds.
+        try:
+            img = load_oct(img_path)
+        except Exception as e:
+            self.statusBar().showMessage(
+                f"Could not load {rec.filename}: {e}"
+            )
+            return
+        self._current_stem = stem
         if stem not in self._editors:
             self._editors[stem] = BoundaryEditor(
                 width=rec.width,
                 auto=rec.auto,
                 corrected={k: v.copy() for k, v in rec.corrected.items()},
             )
-        img_path = self.image_dir / rec.filename
-        img = load_oct(img_path)
         self.canvas.set_image(img.rgb, offset_x=img.layout.left_x)
         self.canvas.set_editor(self._editors[stem])
         self.canvas.set_active_boundary("TOP_y")
@@ -220,8 +229,26 @@ class MainWindow(QMainWindow):
             corrected={k: editor.corrected[k].copy() for k in editor.corrected},
             timestamp=datetime.now(),
         )
-        save_corrections(self.workbook_path, [snap],
-                         scale_um_per_px_y=self._scale_y)
+        try:
+            save_corrections(self.workbook_path, [snap],
+                             scale_um_per_px_y=self._scale_y)
+        except (PermissionError, OSError) as e:
+            # Clean up any leftover .tmp from a partial write before the
+            # atomic rename had a chance to run.
+            tmp = self.workbook_path.with_suffix(
+                self.workbook_path.suffix + ".tmp")
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            QMessageBox.critical(
+                self, "Save failed",
+                f"Could not write {self.workbook_path.name}.\n\n"
+                f"If Excel has the file open, close it and try again.\n\n"
+                f"Details: {e}",
+            )
+            return
         # Sidebar marker reflects xlsx state immediately.
         self.sidebar.mark_corrected(self._current_stem, True)
         editor.mark_clean()
@@ -270,6 +297,46 @@ class MainWindow(QMainWindow):
         new_row = min(count - 1, row + 1)
         if new_row != row:
             self.sidebar.setCurrentRow(new_row)
+
+    def closeEvent(self, event) -> None:
+        """Prompt save/discard/cancel if any image has unsaved edits."""
+        dirty_stems = [stem for stem, ed in self._editors.items() if ed.dirty]
+        if not dirty_stems:
+            super().closeEvent(event)
+            return
+        n = len(dirty_stems)
+        if n == 1 and self._wb is not None:
+            msg = (f"Save changes to "
+                   f"{self._wb.images[dirty_stems[0]].filename} "
+                   f"before closing?")
+        else:
+            msg = (f"You have unsaved changes in {n} images. "
+                   f"Save before closing?")
+        reply = QMessageBox.question(
+            self, "Unsaved changes", msg,
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save,
+        )
+        if reply == QMessageBox.Cancel:
+            event.ignore()
+            return
+        if reply == QMessageBox.Save:
+            # Save each dirty image. If any save fails (e.g. PermissionError
+            # surfaced via QMessageBox in save_current_image), abort close
+            # so the user can address the failure.
+            for stem in dirty_stems:
+                self._current_stem = stem
+                try:
+                    self.save_current_image()
+                except Exception:
+                    event.ignore()
+                    return
+            # If any editor is still dirty (save_current_image returned
+            # early after a write error), abort the close.
+            if any(ed.dirty for ed in self._editors.values()):
+                event.ignore()
+                return
+        super().closeEvent(event)
 
     def _refresh_status(self) -> None:
         """Rebuild the status bar message with edited boundaries + dirty marker."""
