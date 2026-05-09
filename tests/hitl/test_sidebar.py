@@ -42,3 +42,39 @@ def test_sidebar_update_marks_after_save(qtbot):
     assert "✓" not in sb.item(0).text()
     sb.mark_corrected("a", True)
     assert "✓" in sb.item(0).text()
+
+
+def test_sidebar_set_entries_does_not_emit_signal(qtbot):
+    sb = FileListView()
+    qtbot.addWidget(sb)
+    received = []
+    sb.image_selected.connect(received.append)
+    sb.set_entries([
+        FileEntry(stem="a", filename="a.tif", has_corrections=False),
+        FileEntry(stem="b", filename="b.tif", has_corrections=False),
+    ])
+    # Population should not fire the selection signal.
+    assert received == []
+    # But subsequent setCurrentRow does fire.
+    with qtbot.waitSignal(sb.image_selected, timeout=500) as blocker:
+        sb.setCurrentRow(0)
+    assert blocker.args == ["a"]
+
+
+def test_sidebar_mark_corrected_round_trip(qtbot):
+    sb = FileListView()
+    qtbot.addWidget(sb)
+    sb.set_entries([FileEntry(stem="a", filename="a.tif", has_corrections=False)])
+    sb.mark_corrected("a", True)
+    assert "✓" in sb.item(0).text()
+    sb.mark_corrected("a", False)
+    assert "✓" not in sb.item(0).text()
+    assert "a.tif" in sb.item(0).text()
+
+
+def test_sidebar_mark_corrected_unknown_stem_raises(qtbot):
+    sb = FileListView()
+    qtbot.addWidget(sb)
+    sb.set_entries([FileEntry(stem="a", filename="a.tif", has_corrections=False)])
+    with pytest.raises(KeyError):
+        sb.mark_corrected("does-not-exist", True)
