@@ -27,6 +27,7 @@ import pandas as pd
 from PIL import Image
 
 from .boundary_model import BOUNDARY_NAMES, ERASED_THRESHOLD
+from .colors import BOUNDARY_COLORS
 from .db import HitlDb
 
 
@@ -35,16 +36,6 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from io_utils import load_oct  # noqa: E402
-
-
-# Same scheme as src/viz.py and gt_guided.py annotation masks.
-_GT_COLORS: dict[str, tuple[int, int, int]] = {
-    "TOP_y":        (0, 230, 0),     # green
-    "ONL_y":        (0, 220, 220),   # cyan
-    "BM_y":         (230, 50, 200),  # magenta
-    "DET_top_y":    (255, 230, 0),   # yellow
-    "DET_bottom_y": (0, 0, 0),       # black
-}
 
 
 def _compute_effective(auto: dict[str, np.ndarray],
@@ -112,7 +103,7 @@ def _write_annotation_tiff(tiff_src: Path,
     layout = img.layout
     h, w = canvas.shape[:2]
 
-    for name, color in _GT_COLORS.items():
+    for name, color in BOUNDARY_COLORS.items():
         arr = effective.get(name)
         if arr is None:
             continue

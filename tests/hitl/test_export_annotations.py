@@ -94,10 +94,11 @@ def test_export_annotations_writes_csv_and_tiff(db_with_one_correction,
     tiff_path = out_dir / "tiff" / f"{sample_image_stem}_annotation_hitl.tiff"
     assert tiff_path.exists()
     arr = np.array(Image.open(tiff_path))
-    # Sanity: a magenta (BM) pixel should appear somewhere where BM is set.
-    is_magenta = ((arr[..., 0] == 230) & (arr[..., 1] == 50)
-                  & (arr[..., 2] == 200))
-    assert is_magenta.any()
+    # Sanity: a TOP red pixel should appear (HITL palette: TOP_y = (255,64,64)).
+    from src.hitl.colors import BOUNDARY_COLORS
+    r, g, b = BOUNDARY_COLORS["TOP_y"]
+    is_top = ((arr[..., 0] == r) & (arr[..., 1] == g) & (arr[..., 2] == b))
+    assert is_top.any()
 
 
 def test_export_annotations_only_corrected_skips_untouched(

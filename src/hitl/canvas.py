@@ -41,21 +41,12 @@ from PySide6.QtWidgets import (
 )
 
 from .boundary_model import BoundaryEditor
+from .colors import BOUNDARY_COLORS as COLORS
 
 
 class EditMode(Enum):
     DRAG = "drag"
     ERASE = "erase"
-
-
-# Colours used to draw each boundary line (RGB tuples for QPen).
-COLORS: dict[str, tuple[int, int, int]] = {
-    "TOP_y": (255, 64, 64),         # red
-    "ONL_y": (64, 255, 64),         # green
-    "BM_y": (64, 128, 255),         # blue
-    "DET_top_y": (255, 255, 64),    # yellow
-    "DET_bottom_y": (255, 64, 255), # magenta
-}
 
 # Pen width for inactive boundary lines; the active boundary is drawn thicker.
 LINE_WIDTH = 1

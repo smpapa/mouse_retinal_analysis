@@ -25,19 +25,53 @@ from PIL import Image
 from io_utils import OctImage
 
 
-# Boolean RGB masks. Each predicate is intentionally narrow so we don't
-# accidentally capture the original Heidelberg green crosshair markers.
+# --------------------------------------------------------- HITL colours
+# Annotation TIFFs produced by the HITL editor (and the converter for
+# legacy files) use a single, distinct, high-saturation palette
+# (see src/hitl/colors.py). Per-channel thresholds re-parse them
+# reliably without picking up the OCT grayscale image underneath.
+def _mask_top(rgb: np.ndarray) -> np.ndarray:
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    return (R > 200) & (G < 100) & (B < 100)        # red
+
+
+def _mask_onl(rgb: np.ndarray) -> np.ndarray:
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    return (G > 200) & (R < 100) & (B < 100)        # green
+
+
 def _mask_bm(rgb: np.ndarray) -> np.ndarray:
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    # HITL BM is (64, 128, 255). Blue dominant, mid green tolerated.
+    return (B > 200) & (R < 100) & (G < 200)        # blue
+
+
+def _mask_det_top(rgb: np.ndarray) -> np.ndarray:
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    return (R > 200) & (G > 200) & (B < 100)        # yellow
+
+
+def _mask_det_bot(rgb: np.ndarray) -> np.ndarray:
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    return (R > 200) & (G < 100) & (B > 200)        # magenta
+
+
+# --------------------------------------------------------- legacy masks
+# Heidelberg-marked annotation TIFFs (4H/6H images) use a different
+# palette (BM magenta-ish, TOP green, ONL cyan, DET top yellow,
+# DET bot black). Kept here so:
+#   - tools/convert_legacy_annotations can read these files and
+#     re-render with HITL colours.
+#   - load_gt can transparently fall back to legacy masks when no
+#     HITL colours are detected (so users can still validate against
+#     un-converted Heidelberg annotations).
+def _mask_bm_legacy(rgb: np.ndarray) -> np.ndarray:
     R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
     return (R > 130) & (G < 100) & (B > 90)
 
 
-def _mask_top(rgb: np.ndarray, original_rgb: np.ndarray) -> np.ndarray:
-    """TOP green pixels appearing in the annotation but not in the source.
-
-    We exclude pixels that already exist as green in the original TIFF
-    (Heidelberg crosshair, scan markers, etc.).
-    """
+def _mask_top_legacy(rgb: np.ndarray, original_rgb: np.ndarray) -> np.ndarray:
+    """Legacy TOP: green pixels in annotation but not in the source TIFF."""
     R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
     is_green = (G > 110) & (G > R + 30) & (G > B + 30)
     Ro, Go, Bo = original_rgb[..., 0], original_rgb[..., 1], original_rgb[..., 2]
@@ -45,16 +79,14 @@ def _mask_top(rgb: np.ndarray, original_rgb: np.ndarray) -> np.ndarray:
     return is_green & (~same_as_orig)
 
 
-def _mask_onl(rgb: np.ndarray) -> np.ndarray:
+def _mask_onl_legacy(rgb: np.ndarray) -> np.ndarray:
     R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    # Cyan/blue: B is the dominant channel
-    return (B > 130) & (B > R + 30)
+    return (B > 130) & (B > R + 30)                  # cyan / blue
 
 
-def _mask_det(rgb: np.ndarray) -> np.ndarray:
+def _mask_det_legacy(rgb: np.ndarray) -> np.ndarray:
     R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    # Yellow: high R and G, low B
-    return (R > 130) & (G > 130) & (B < 80)
+    return (R > 130) & (G > 130) & (B < 80)          # yellow (single colour)
 
 
 @dataclass
@@ -121,6 +153,12 @@ def load_gt(annotation_path: str | Path,
             oct_image: OctImage) -> GTBoundaries:
     """Extract per-column GT boundaries from an annotation TIFF.
 
+    Auto-detects the colour scheme:
+      - HITL palette (red / green / blue / yellow / magenta) used by
+        ``hitl/export_annotations.py`` and the legacy converter.
+      - Legacy Heidelberg palette (green / cyan / magenta / yellow /
+        black) used by the original 4H/6H annotations.
+
     The annotation must share the same image dimensions as `oct_image`.
     """
     p = Path(annotation_path)
@@ -132,24 +170,35 @@ def load_gt(annotation_path: str | Path,
 
     l = oct_image.layout
     crop = lambda m: m[l.top_y:l.bot_y + 1, l.left_x:l.right_x + 1]
-
-    bm_mask = crop(_mask_bm(anno))
-    top_mask = crop(_mask_top(anno, oct_image.rgb))
-    onl_mask = crop(_mask_onl(anno))
-    det_mask = crop(_mask_det(anno))
-
-    # Retinal layers live in roughly the upper half of the B-scan panel.
-    # Restricting the mean-y computation to this y range prevents stray
-    # cyan/magenta/yellow pixels in scale labels and UI text from polluting
-    # the GT extraction.
-    H = bm_mask.shape[0]
+    H = l.bot_y - l.top_y + 1
     retinal_y_lo, retinal_y_hi = int(H * 0.10), int(H * 0.55)
 
+    # Try HITL-colour masks first.
+    bm_mask = crop(_mask_bm(anno))
+    if bm_mask.any():
+        top_mask = crop(_mask_top(anno))
+        onl_mask = crop(_mask_onl(anno))
+        det_top_mask = crop(_mask_det_top(anno))
+        det_bot_mask = crop(_mask_det_bot(anno))
+        BM = _column_y_from_mask(bm_mask, retinal_y_lo, retinal_y_hi)
+        TOP = _column_y_from_mask(top_mask, retinal_y_lo, retinal_y_hi)
+        ONL = _column_y_from_mask(onl_mask, retinal_y_lo, retinal_y_hi)
+        DET_top = _column_y_from_mask(det_top_mask,
+                                        retinal_y_lo, retinal_y_hi)
+        DET_bot = _column_y_from_mask(det_bot_mask,
+                                        retinal_y_lo, retinal_y_hi)
+        return GTBoundaries(TOP=TOP, ONL=ONL, BM=BM,
+                            DET_top=DET_top, DET_bottom=DET_bot)
+
+    # Fall back to the legacy Heidelberg palette.
+    bm_mask = crop(_mask_bm_legacy(anno))
+    top_mask = crop(_mask_top_legacy(anno, oct_image.rgb))
+    onl_mask = crop(_mask_onl_legacy(anno))
+    det_mask = crop(_mask_det_legacy(anno))
     BM = _column_y_from_mask(bm_mask, retinal_y_lo, retinal_y_hi)
     TOP = _column_y_from_mask(top_mask, retinal_y_lo, retinal_y_hi)
     ONL = _column_y_from_mask(onl_mask, retinal_y_lo, retinal_y_hi)
     DET_top, DET_bot = _split_run(det_mask, retinal_y_lo, retinal_y_hi)
-
     return GTBoundaries(TOP=TOP, ONL=ONL, BM=BM,
                         DET_top=DET_top, DET_bottom=DET_bot)
 

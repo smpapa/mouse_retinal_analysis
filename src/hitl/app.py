@@ -25,6 +25,7 @@ from .boundary_model import (BOUNDARY_NAMES, BoundaryEditor,
                               ERASED_THRESHOLD)                      # noqa: E402
 from .boundary_toggle import BoundaryToggleBar                      # noqa: E402
 from .canvas import EditMode, OverlayCanvas                         # noqa: E402
+from .convert_annotations import convert_legacy_folder               # noqa: E402
 from .db import HitlDb                                               # noqa: E402
 from .export_annotations import export_annotations                   # noqa: E402
 from .overlay_render import render_corrected_overlay                # noqa: E402
@@ -70,6 +71,32 @@ class _AnnotationExportWorker(QObject):
                 self.db, self.image_dir, self.out_dir,
                 formats=self.formats,
                 only_corrected=self.only_corrected,
+                progress_callback=self._on_progress,
+            )
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _on_progress(self, i, n, name):
+        self.progress.emit(int(i), int(n), str(name))
+
+
+class _LegacyConvertWorker(QObject):
+    """Background-thread worker for convert_legacy_folder()."""
+    progress = Signal(int, int, str)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, legacy_dir, original_image_dir, out_dir):
+        super().__init__()
+        self.legacy_dir = legacy_dir
+        self.original_image_dir = original_image_dir
+        self.out_dir = out_dir
+
+    def run(self):
+        try:
+            result = convert_legacy_folder(
+                self.legacy_dir, self.original_image_dir, self.out_dir,
                 progress_callback=self._on_progress,
             )
             self.finished.emit(result)
@@ -215,6 +242,13 @@ class MainWindow(QMainWindow):
             self._export_annotations
         )
         tools_menu.addAction(self.act_export_annotations)
+        self.act_convert_legacy = QAction(
+            "Convert Legacy Annotation TIFFs to HITL Colours...", self
+        )
+        self.act_convert_legacy.triggered.connect(
+            self._convert_legacy_annotations
+        )
+        tools_menu.addAction(self.act_convert_legacy)
 
     def _setup_shortcuts(self) -> None:
         # Boundary picker shortcuts: 1..5 select active boundary.
@@ -436,6 +470,119 @@ class MainWindow(QMainWindow):
         editor.undo()
         self.canvas.refresh()
         self._refresh_status()
+
+    def _convert_legacy_annotations(self) -> None:
+        """Tools > Convert Legacy Annotation TIFFs to HITL Colours.
+
+        Walks an existing ``annotation/`` folder of Heidelberg-palette
+        ``*_annotation.tiff`` files, looks up each matching un-annotated
+        TIFF in the data folder, and writes HITL-coloured equivalents
+        to a chosen output folder.
+        """
+        # Default legacy folder: data_dir / annotation
+        default_legacy = self.image_dir / "annotation"
+        legacy = QFileDialog.getExistingDirectory(
+            self, "Select folder with legacy *_annotation.tiff files",
+            str(default_legacy if default_legacy.exists()
+                else self.image_dir),
+        )
+        if not legacy:
+            return
+        legacy_dir = Path(legacy)
+        # Source TIFF folder (un-annotated). Default to the editor's
+        # current image dir.
+        original_dir = QFileDialog.getExistingDirectory(
+            self, "Select folder with original (un-annotated) TIFFs",
+            str(self.image_dir),
+        )
+        if not original_dir:
+            return
+        # Output folder.
+        default_out = legacy_dir.parent / "annotation_hitl"
+        out_chosen = QFileDialog.getExistingDirectory(
+            self, "Choose output folder for converted TIFFs",
+            str(default_out),
+        )
+        if not out_chosen:
+            return
+        out_dir = Path(out_chosen)
+
+        # Quick inventory.
+        n_files = sum(
+            1 for _ in (
+                list(legacy_dir.glob("*_annotation.tiff"))
+                + list(legacy_dir.glob("*_annotation.tif"))
+            )
+        )
+        if n_files == 0:
+            QMessageBox.information(
+                self, "Nothing to convert",
+                f"No *_annotation.tiff files found in:\n{legacy_dir}",
+            )
+            return
+
+        progress = QProgressDialog(
+            f"Converting {n_files} legacy annotation file(s)...",
+            None, 0, n_files, self,
+        )
+        progress.setWindowTitle("Convert Legacy Annotations")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+        QApplication.processEvents()
+
+        loop = QEventLoop()
+        thread = QThread(self)
+        worker = _LegacyConvertWorker(legacy_dir, Path(original_dir), out_dir)
+        worker.moveToThread(thread)
+        result_holder: dict = {"ok": False, "result": None, "err": None}
+
+        def on_progress(i: int, n: int, name: str):
+            progress.setMaximum(n)
+            progress.setValue(i)
+            progress.setLabelText(f"[{i}/{n}] {name}")
+
+        def on_finished(result: dict):
+            result_holder["ok"] = True
+            result_holder["result"] = result
+            loop.quit()
+
+        def on_error(msg: str):
+            result_holder["err"] = msg
+            loop.quit()
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        thread.started.connect(worker.run)
+        thread.start()
+        loop.exec()
+        thread.quit()
+        thread.wait()
+        progress.close()
+
+        if not result_holder["ok"]:
+            QMessageBox.critical(
+                self, "Conversion failed",
+                result_holder["err"] or "Unknown error",
+            )
+            return
+        r = result_holder["result"]
+        msg = (
+            f"Converted {r['converted']} annotation TIFF(s) to:\n"
+            f"{out_dir}"
+        )
+        if r.get("skipped_no_source"):
+            msg += (
+                f"\n\n{r['skipped_no_source']} file(s) skipped: "
+                "no matching source TIFF found in the original image "
+                "folder. Make sure the source TIFFs and the legacy "
+                "annotations share the same stem."
+            )
+        QMessageBox.information(self, "Conversion complete", msg)
+        self.statusBar().showMessage(f"Converted to {out_dir}")
 
     def _export_annotations(self) -> None:
         """Tools > Export Annotations: write CSV + annotation TIFF for
