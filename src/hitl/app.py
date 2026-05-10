@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 import sys
-import traceback
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (QApplication, QDockWidget, QFileDialog,
                                 QLabel, QMainWindow, QMessageBox,
@@ -26,30 +25,10 @@ from .boundary_model import (BOUNDARY_NAMES, BoundaryEditor,
                               ERASED_THRESHOLD)                      # noqa: E402
 from .boundary_toggle import BoundaryToggleBar                      # noqa: E402
 from .canvas import EditMode, OverlayCanvas                         # noqa: E402
+from .db import HitlDb                                               # noqa: E402
 from .overlay_render import render_corrected_overlay                # noqa: E402
 from .sidebar import FileEntry, FileListView                        # noqa: E402
-from .storage import (CorrectedSnapshot, Workbook,
-                      load_workbook, save_corrections)              # noqa: E402
-
-
-class _SaveWorker(QObject):
-    """Background-thread worker that flushes a cached openpyxl Workbook
-    to disk via the storage helpers."""
-    finished = Signal()
-    error = Signal(str)
-
-    def __init__(self, wb, path):
-        super().__init__()
-        self.wb = wb
-        self.path = path
-
-    def run(self):
-        try:
-            from .storage import save_workbook_atomic
-            save_workbook_atomic(self.wb, self.path)
-            self.finished.emit()
-        except Exception as e:
-            self.error.emit(f"{e}\n\n{traceback.format_exc()}")
+from .storage import CorrectedSnapshot                              # noqa: E402
 
 
 class MainWindow(QMainWindow):
@@ -58,7 +37,6 @@ class MainWindow(QMainWindow):
         self.workbook_path = Path(workbook_path)
         self.image_dir = Path(image_dir)
         self._editors: dict[str, BoundaryEditor] = {}
-        self._wb: Workbook | None = None
         self._current_stem: str | None = None
         self._scale_y = 3.87  # default; overridden if summary has it.
         # When True, _on_sidebar_image_selected skips the unsaved-changes
@@ -69,22 +47,26 @@ class MainWindow(QMainWindow):
         self._batch_thread: QThread | None = None
         self._batch_worker: BatchWorker | None = None
         self._progress_dialog: QProgressDialog | None = None
-        # Cached openpyxl workbook (loaded lazily on first save) so we
-        # don't pay the ~10 s reload cost every Ctrl+S. Invalidated when
-        # the user switches data folders.
-        self._openpyxl_wb = None
-        # Background save state.
-        self._save_thread: QThread | None = None
-        self._save_worker = None
-        self._save_in_flight: bool = False
-        self._pending_snapshots: list = []  # of CorrectedSnapshot
-        self._currently_saving_stems: list[str] = []
+        # SQLite-backed canonical store. Saves go here directly (~5 ms).
+        # The xlsx is exported on demand (File > Export to Excel) or
+        # automatically on close.
+        self._db: HitlDb | None = None
+        # Lightweight metadata: stem -> {"filename", "width", "scale_y"}.
+        # Populated from the DB so we don't have to re-load the slow xlsx
+        # on startup.
+        self._image_meta: dict[str, dict] = {}
+        # True after at least one save_current_image() in this session
+        # (or after Tools > Run Auto Analysis). closeEvent checks this
+        # so it doesn't trigger an unnecessary slow xlsx export when
+        # the user just opens the editor and closes without editing.
+        self._edits_since_export: bool = False
 
         self._build_ui()
-        # If a real workbook exists, load it. Otherwise leave the UI empty
-        # so the user can pick a folder via File > Open Data Folder.
+        # If a real workbook exists, open the DB (importing from xlsx if
+        # this is the first run). Otherwise leave the UI empty so the
+        # user can pick a folder via File > Open Data Folder.
         if self.workbook_path.exists():
-            self._reload_workbook()
+            self._open_db_for_workbook()
 
     def _build_ui(self) -> None:
         self.setWindowTitle("OCT HITL Editor")
@@ -168,6 +150,9 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         # Reuse the toolbar's Save action so its shortcut and label match.
         file_menu.addAction(self.act_save)
+        self.act_export = QAction("&Export to Excel...", self)
+        self.act_export.triggered.connect(self._export_to_xlsx)
+        file_menu.addAction(self.act_export)
 
         tools_menu = menubar.addMenu("&Tools")
         self.act_run_batch = QAction("&Run Auto Analysis...", self)
@@ -215,22 +200,54 @@ class MainWindow(QMainWindow):
         self.canvas.set_mode(EditMode.ERASE)
         self.act_erase.setChecked(True)
 
-    def _reload_workbook(self) -> None:
-        self._wb = load_workbook(self.workbook_path)
-        # Pull scale_um_per_px_y from summary if present.
-        if "scale_um_per_px_y" in self._wb.summary.columns:
+    def _open_db_for_workbook(self) -> None:
+        """Open (or create) the SQLite store for the current workbook.
+
+        First-time use: imports the xlsx into the DB. Subsequent runs
+        skip the import — the DB is now the source of truth.
+        """
+        db_path = (self.workbook_path.parent / "db" /
+                   f"{self.workbook_path.stem}.db")
+        try:
+            self._db = HitlDb(db_path)
+        except Exception as e:
+            QMessageBox.critical(self, "DB error",
+                                  f"Could not open {db_path}: {e}")
+            return
+        if self._db.is_empty():
+            self.statusBar().showMessage("Importing workbook into DB...")
             try:
-                self._scale_y = float(self._wb.summary["scale_um_per_px_y"].iloc[0])
-            except (TypeError, ValueError):
-                pass
-        entries = []
-        for stem, rec in self._wb.images.items():
-            has_corr = any(np.any(~np.isnan(arr))
-                           for arr in rec.corrected.values())
-            entries.append(FileEntry(stem=stem,
-                                     filename=rec.filename,
-                                     has_corrections=has_corr))
-        entries.sort(key=lambda e: e.stem)
+                self._db.import_from_xlsx(self.workbook_path)
+            except Exception as e:
+                QMessageBox.critical(self, "Import failed",
+                                      f"Could not import workbook: {e}")
+                return
+        self._refresh_image_meta_and_sidebar()
+
+    def _refresh_image_meta_and_sidebar(self) -> None:
+        """Pull lightweight metadata + sidebar state from the DB."""
+        if self._db is None:
+            return
+        self._image_meta.clear()
+        cur = self._db._conn.execute(
+            "SELECT stem, filename, width, scale_um_per_px_y FROM images"
+        )
+        for stem, filename, width, scale in cur.fetchall():
+            self._image_meta[stem] = {
+                "filename": filename,
+                "width": int(width),
+                "scale_y": float(scale) if scale else 3.87,
+            }
+        # Pick the first image's scale as the global default — all
+        # images in a session typically share the same scale.
+        if self._image_meta:
+            self._scale_y = next(iter(self._image_meta.values()))["scale_y"]
+        entries = [
+            FileEntry(stem=stem,
+                       filename=filename,
+                       has_corrections=has_corr)
+            for stem, filename, has_corr in self._db.list_images()
+        ]
         self.sidebar.set_entries(entries)
 
     def _on_sidebar_image_selected(self, stem: str) -> None:
@@ -248,8 +265,8 @@ class MainWindow(QMainWindow):
                 and prev != stem
                 and self._editors.get(prev) is not None
                 and self._editors[prev].dirty):
-            current_filename = (self._wb.images[prev].filename
-                                if self._wb is not None else prev)
+            current_filename = self._image_meta.get(
+                prev, {}).get("filename", prev)
             reply = QMessageBox.question(
                 self, "Unsaved changes",
                 f"Save changes to {current_filename} before switching?",
@@ -273,10 +290,10 @@ class MainWindow(QMainWindow):
         self.select_image(stem)
 
     def select_image(self, stem: str) -> None:
-        if self._wb is None or stem not in self._wb.images:
+        if self._db is None or stem not in self._image_meta:
             return
-        rec = self._wb.images[stem]
-        img_path = self.image_dir / rec.filename
+        meta = self._image_meta[stem]
+        img_path = self.image_dir / meta["filename"]
         # Load the TIFF first so a missing/corrupt file doesn't leave the
         # window pointing at a broken image. _current_stem is only updated
         # after the load succeeds.
@@ -284,11 +301,15 @@ class MainWindow(QMainWindow):
             img = load_oct(img_path)
         except Exception as e:
             self.statusBar().showMessage(
-                f"Could not load {rec.filename}: {e}"
+                f"Could not load {meta['filename']}: {e}"
             )
             return
         self._current_stem = stem
         if stem not in self._editors:
+            rec = self._db.load_image(stem)
+            if rec is None:
+                self.statusBar().showMessage(f"Image {stem} not in DB.")
+                return
             self._editors[stem] = BoundaryEditor(
                 width=rec.width,
                 auto=rec.auto,
@@ -307,13 +328,14 @@ class MainWindow(QMainWindow):
         self._refresh_status()
 
     def save_current_image(self) -> None:
-        """Queue the current image's edits for an asynchronous flush.
+        """Persist the current image's edits to the local DB.
 
-        UI feedback is immediate: sidebar gains the ✓ marker and the PNG
-        is rendered up-front. The slow xlsx write happens on a background
-        thread so the user can move to the next image right away.
+        DB writes are synchronous and fast (~5–50 ms), so there is no
+        background queue. The sidebar is marked, the editor cleaned, and
+        the corrected overlay PNG re-rendered all in one straight-line
+        path.
         """
-        if self._current_stem is None:
+        if self._current_stem is None or self._db is None:
             return
         editor = self._editors[self._current_stem]
         snap = CorrectedSnapshot(
@@ -322,115 +344,33 @@ class MainWindow(QMainWindow):
                        for k in editor.corrected},
             timestamp=datetime.now(),
         )
-        self._pending_snapshots.append(snap)
-        # Optimistic UI: sidebar ✓ + render PNG immediately. mark_clean
-        # is deferred until the worker confirms the disk write so a
-        # failure leaves the editor dirty for retry.
-        self.sidebar.mark_corrected(self._current_stem, True)
-        rec = self._wb.images[self._current_stem]
         try:
-            img_path = self.image_dir / rec.filename
+            self._db.save_corrections(snap)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Save failed",
+                f"Could not write the local DB.\n\nDetails: {e}",
+            )
+            return
+        self._edits_since_export = True
+        self.sidebar.mark_corrected(self._current_stem, True)
+        editor.mark_clean()
+        meta = self._image_meta.get(self._current_stem, {})
+        filename = meta.get("filename", self._current_stem)
+        # Re-render the corrected overlay PNG. Failure is non-fatal;
+        # the DB save already succeeded.
+        try:
+            img_path = self.image_dir / filename
             out_path = (self.workbook_path.parent /
                         f"{self._current_stem}_overlay_corrected.png")
             boundaries = {k: editor.effective(k) for k in editor.auto}
             render_corrected_overlay(img_path, boundaries, out_path)
         except Exception as e:
             self.statusBar().showMessage(
-                f"Save queued for {rec.filename} (overlay PNG failed: {e})")
-        else:
-            self.statusBar().showMessage(f"Saving {rec.filename}...")
-        # Kick off the disk flush if no save is currently in flight.
-        if not self._save_in_flight:
-            self._kick_save_cycle()
-
-    def _kick_save_cycle(self) -> None:
-        """Apply queued snapshots to the cached workbook and spawn a
-        background thread to flush it to disk. Caller must guarantee
-        no save is currently in flight."""
-        if not self._pending_snapshots:
+                f"Saved {filename} (overlay PNG failed: {e})")
             return
-        from openpyxl import load_workbook as _openpyxl_load
-        from .storage import apply_corrections_inplace, save_workbook_atomic
-
-        snaps = self._pending_snapshots[:]
-        self._pending_snapshots.clear()
-        # Lazy-load the openpyxl workbook on first save; reused after.
-        if self._openpyxl_wb is None:
-            try:
-                self._openpyxl_wb = _openpyxl_load(str(self.workbook_path))
-            except Exception as e:
-                QMessageBox.critical(self, "Save failed",
-                                      f"Could not open workbook: {e}")
-                return
-        # Apply mutations to the in-memory workbook on the main thread
-        # (the worker only reads it). This is fast (~50 ms per snap).
-        try:
-            apply_corrections_inplace(
-                self._openpyxl_wb, snaps, self._scale_y,
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "Save failed",
-                                  f"Could not apply corrections: {e}")
-            return
-        # Spawn the background flush.
-        self._save_in_flight = True
-        self._currently_saving_stems = [s.stem for s in snaps]
-        self._save_thread = QThread(self)
-        self._save_worker = _SaveWorker(self._openpyxl_wb,
-                                          self.workbook_path)
-        self._save_worker.moveToThread(self._save_thread)
-        self._save_thread.started.connect(self._save_worker.run)
-        self._save_worker.finished.connect(self._on_save_finished)
-        self._save_worker.error.connect(self._on_save_error)
-        self._save_thread.start()
-
-    def _on_save_finished(self) -> None:
-        # Mark editors clean now that the disk write completed.
-        for stem in self._currently_saving_stems:
-            ed = self._editors.get(stem)
-            if ed is not None:
-                ed.mark_clean()
-        if self._save_thread is not None:
-            self._save_thread.quit()
-            self._save_thread.wait()
-        self._save_thread = None
-        self._save_worker = None
-        self._save_in_flight = False
-        stems = self._currently_saving_stems
-        self._currently_saving_stems = []
-        if stems:
-            last = stems[-1]
-            rec = self._wb.images.get(last) if self._wb else None
-            label = rec.filename if rec is not None else last
-            self.statusBar().showMessage(f"Saved {label}")
+        self.statusBar().showMessage(f"Saved {filename}")
         self._refresh_status()
-        # Process anything queued during the just-finished flush.
-        if self._pending_snapshots:
-            self._kick_save_cycle()
-
-    def _on_save_error(self, msg: str) -> None:
-        # Clean up any leftover .tmp from a partial write.
-        tmp = self.workbook_path.with_suffix(
-            self.workbook_path.suffix + ".tmp")
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-        if self._save_thread is not None:
-            self._save_thread.quit()
-            self._save_thread.wait()
-        self._save_thread = None
-        self._save_worker = None
-        self._save_in_flight = False
-        self._currently_saving_stems = []
-        self.statusBar().showMessage("Save failed")
-        QMessageBox.critical(
-            self, "Save failed",
-            f"Could not write {self.workbook_path.name}.\n\n"
-            f"If Excel has the file open, close it and try again.\n\n"
-            f"Details: {msg}",
-        )
 
     def _undo(self) -> None:
         if self._current_stem is None:
@@ -439,6 +379,31 @@ class MainWindow(QMainWindow):
         editor.undo()
         self.canvas.refresh()
         self._refresh_status()
+
+    def _export_to_xlsx(self) -> None:
+        """File > Export to Excel — write the current DB state to xlsx."""
+        if self._db is None:
+            QMessageBox.information(
+                self, "Nothing to export",
+                "Open a data folder first.",
+            )
+            return
+        # Default to overwriting the source workbook, but let the user
+        # pick another path so they can keep snapshots if desired.
+        dst, _ = QFileDialog.getSaveFileName(
+            self, "Export to Excel",
+            str(self.workbook_path),
+            "Excel workbook (*.xlsx)",
+        )
+        if not dst:
+            return
+        try:
+            self._db.export_to_xlsx(dst)
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", str(e))
+            return
+        self._edits_since_export = False
+        self.statusBar().showMessage(f"Exported {dst}")
 
     # ------------------------------------------------------ data folder
 
@@ -494,10 +459,11 @@ class MainWindow(QMainWindow):
         dirty = [s for s, ed in self._editors.items() if ed.dirty]
         if dirty:
             n = len(dirty)
+            first_filename = self._image_meta.get(
+                dirty[0], {}).get("filename", dirty[0])
             msg = (f"Save changes to {n} image(s) before switching folder?"
                    if n > 1 else
-                   f"Save changes to {self._wb.images[dirty[0]].filename} "
-                   "before switching folder?")
+                   f"Save changes to {first_filename} before switching folder?")
             reply = QMessageBox.question(
                 self, "Unsaved changes", msg,
                 QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
@@ -509,41 +475,19 @@ class MainWindow(QMainWindow):
                 for stem in dirty:
                     self._current_stem = stem
                     self.save_current_image()
-                # Wait for any background save to complete before switch.
-                self._wait_for_save()
                 if any(ed.dirty for ed in self._editors.values()):
                     return  # save failed — abort the switch
+        # Close the previous DB.
+        if self._db is not None:
+            self._db.close()
+            self._db = None
         self.image_dir = Path(image_dir)
         self.workbook_path = Path(workbook_path)
         self._editors.clear()
         self._current_stem = None
-        # Discard cached openpyxl workbook so the new folder loads fresh.
-        if self._openpyxl_wb is not None:
-            try:
-                self._openpyxl_wb.close()
-            except Exception:
-                pass
-        self._openpyxl_wb = None
-        self._reload_workbook()
+        self._image_meta.clear()
+        self._open_db_for_workbook()
         self.statusBar().showMessage(f"Loaded {self.workbook_path}")
-
-    def _wait_for_save(self, timeout_ms: int = 60_000) -> bool:
-        """Block until the background save thread (if any) completes.
-
-        Returns True on success, False on timeout.
-        """
-        if self._save_thread is None:
-            return True
-        # Process events while waiting so the worker's finished signal
-        # gets dispatched on the main thread.
-        from PySide6.QtCore import QCoreApplication
-        deadline = timeout_ms
-        step = 50
-        while self._save_in_flight and deadline > 0:
-            QCoreApplication.processEvents()
-            QThread.msleep(step)
-            deadline -= step
-        return not self._save_in_flight
 
     # ----------------------------------------------------- batch runner
 
@@ -621,17 +565,19 @@ class MainWindow(QMainWindow):
     def _on_batch_finished(self, xlsx_path: str) -> None:
         self._cleanup_batch_worker()
         self.workbook_path = Path(xlsx_path)
-        # Editors and the cached openpyxl workbook are stale after
-        # re-analysis (the on-disk xlsx changed); rebuild from scratch.
+        # Editors are stale after re-analysis. Re-import the freshly
+        # written xlsx into the DB (preserving any prior corrections).
         self._editors.clear()
         self._current_stem = None
-        if self._openpyxl_wb is not None:
+        if self._db is not None:
             try:
-                self._openpyxl_wb.close()
-            except Exception:
-                pass
-        self._openpyxl_wb = None
-        self._reload_workbook()
+                self._db.import_from_xlsx(self.workbook_path,
+                                           preserve_corrected_in_db=True)
+            except Exception as e:
+                QMessageBox.critical(self, "Reimport failed", str(e))
+            self._refresh_image_meta_and_sidebar()
+        else:
+            self._open_db_for_workbook()
         QMessageBox.information(
             self, "Done",
             f"Auto analysis complete:\n{xlsx_path}",
@@ -662,46 +608,56 @@ class MainWindow(QMainWindow):
             self.sidebar.setCurrentRow(new_row)
 
     def closeEvent(self, event) -> None:
-        """Prompt save/discard/cancel if any image has unsaved edits."""
+        """Prompt save/discard/cancel for unsaved edits, then auto-export
+        to xlsx if the DB has any corrections (so external tools always
+        see the latest state on disk)."""
         dirty_stems = [stem for stem, ed in self._editors.items() if ed.dirty]
-        if not dirty_stems:
-            super().closeEvent(event)
-            return
-        n = len(dirty_stems)
-        if n == 1 and self._wb is not None:
-            msg = (f"Save changes to "
-                   f"{self._wb.images[dirty_stems[0]].filename} "
-                   f"before closing?")
-        else:
-            msg = (f"You have unsaved changes in {n} images. "
-                   f"Save before closing?")
-        reply = QMessageBox.question(
-            self, "Unsaved changes", msg,
-            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-            QMessageBox.Save,
-        )
-        if reply == QMessageBox.Cancel:
-            event.ignore()
-            return
-        if reply == QMessageBox.Save:
-            # Queue saves for each dirty image, then block until the
-            # background worker finishes flushing.
-            for stem in dirty_stems:
-                self._current_stem = stem
-                try:
-                    self.save_current_image()
-                except Exception:
-                    event.ignore()
-                    return
-            # save_current_image is async — wait for the worker.
-            self._wait_for_save()
-            if any(ed.dirty for ed in self._editors.values()):
+        if dirty_stems:
+            n = len(dirty_stems)
+            first_filename = self._image_meta.get(
+                dirty_stems[0], {}).get("filename", dirty_stems[0])
+            msg = (f"Save changes to {first_filename} before closing?"
+                   if n == 1 else
+                   f"You have unsaved changes in {n} images. "
+                   "Save before closing?")
+            reply = QMessageBox.question(
+                self, "Unsaved changes", msg,
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if reply == QMessageBox.Cancel:
                 event.ignore()
                 return
-        else:  # Discard
-            # Even on discard, wait for any in-flight save so we don't
-            # tear down the workbook mid-write.
-            self._wait_for_save()
+            if reply == QMessageBox.Save:
+                for stem in dirty_stems:
+                    self._current_stem = stem
+                    try:
+                        self.save_current_image()
+                    except Exception:
+                        event.ignore()
+                        return
+                if any(ed.dirty for ed in self._editors.values()):
+                    event.ignore()
+                    return
+        # Auto-export to xlsx if the user actually saved during this
+        # session. We skip the export when the editor is opened and
+        # closed without edits, so closing is instant in that case.
+        if (self._db is not None and self._edits_since_export
+                and self._db.has_corrections()):
+            try:
+                self._db.export_to_xlsx(self.workbook_path)
+            except Exception as e:
+                # Don't block close on a failed export — DB is still
+                # canonical and the user can re-export from File menu.
+                QMessageBox.warning(
+                    self, "Auto-export failed",
+                    "DB is saved, but xlsx auto-export failed:\n"
+                    f"{e}\n\n"
+                    "Use File > Export to Excel later to retry."
+                )
+        if self._db is not None:
+            self._db.close()
+            self._db = None
         super().closeEvent(event)
 
     def _on_canvas_hover(self, x_local: int) -> None:
@@ -748,11 +704,11 @@ class MainWindow(QMainWindow):
 
     def _refresh_status(self) -> None:
         """Rebuild the status bar message with edited boundaries + dirty marker."""
-        if self._current_stem is None or self._wb is None:
+        if self._current_stem is None:
             return
-        if self._current_stem not in self._wb.images:
+        meta = self._image_meta.get(self._current_stem)
+        if meta is None:
             return
-        rec = self._wb.images[self._current_stem]
         editor = self._editors.get(self._current_stem)
         if editor is None:
             return
@@ -766,7 +722,7 @@ class MainWindow(QMainWindow):
             touched = bool(np.any((~np.isnan(corr)) | (corr < ERASED_THRESHOLD)))
             if touched:
                 edited.append(name.replace("_y", ""))
-        parts = [rec.filename, f"{rec.width} cols"]
+        parts = [meta["filename"], f"{meta['width']} cols"]
         if edited:
             parts.append("edited: " + ", ".join(edited))
         if editor.dirty:

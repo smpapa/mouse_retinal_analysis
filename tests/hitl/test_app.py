@@ -27,17 +27,37 @@ def test_mainwindow_loads_workbook_into_sidebar(qtbot, tmp_path,
 def test_mainwindow_save_persists_corrections(qtbot, tmp_path,
                                               oct_results_xlsx,
                                               sample_image_stem):
+    """save_current_image now writes to the local DB. The xlsx is only
+    refreshed on explicit export (or auto-export at close)."""
     dst = tmp_path / "oct_results.xlsx"
     shutil.copy(oct_results_xlsx, dst)
     win = MainWindow(workbook_path=dst,
                      image_dir=oct_results_xlsx.parent.parent)
     qtbot.addWidget(win)
     win.select_image(sample_image_stem)
-    # Programmatically edit and save.
     win.canvas.set_active_boundary("TOP_y")
     win.canvas.simulate_drag_to(x=0, y=99.0)
     win.save_current_image()
+    rec = win._db.load_image(sample_image_stem)
+    assert rec.corrected["TOP_y"][0] == pytest.approx(99.0)
+
+
+def test_mainwindow_export_writes_xlsx(qtbot, tmp_path, oct_results_xlsx,
+                                        sample_image_stem):
+    """File > Export to Excel writes the legacy xlsx schema."""
+    dst = tmp_path / "oct_results.xlsx"
+    shutil.copy(oct_results_xlsx, dst)
+    win = MainWindow(workbook_path=dst,
+                     image_dir=oct_results_xlsx.parent.parent)
+    qtbot.addWidget(win)
+    win.select_image(sample_image_stem)
+    win.canvas.set_active_boundary("TOP_y")
+    win.canvas.simulate_drag_to(x=0, y=99.0)
+    win.save_current_image()
+    # Direct call to the export helper (bypasses the QFileDialog).
+    win._db.export_to_xlsx(dst)
     df = pd.read_excel(dst, sheet_name=sample_image_stem)
+    assert "TOP_y_corrected" in df.columns
     assert df["TOP_y_corrected"].iloc[0] == pytest.approx(99.0)
 
 
@@ -64,7 +84,9 @@ def test_mainwindow_arrow_keys_navigate(qtbot, tmp_path, oct_results_xlsx):
     win = MainWindow(workbook_path=dst,
                      image_dir=oct_results_xlsx.parent.parent)
     qtbot.addWidget(win)
-    win.show()
+    # Avoid win.show() — actually displaying the window can hang the
+    # test runner when other tests have created QGraphicsViews ahead
+    # of us. The navigation logic does not depend on visibility.
     win.sidebar.setCurrentRow(0)
     first_stem = win.sidebar._stem_for_row[0]
     second_stem = win.sidebar._stem_for_row[1]
@@ -192,7 +214,7 @@ def test_mainwindow_constructs_with_missing_workbook_path(qtbot, tmp_path):
     win = MainWindow(workbook_path=fake, image_dir=tmp_path)
     qtbot.addWidget(win)
     # No editors, no current image — but the window built successfully.
-    assert win._wb is None
+    assert win._db is None
     assert win.sidebar.count() == 0
 
 

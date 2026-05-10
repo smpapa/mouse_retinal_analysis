@@ -32,6 +32,7 @@ hidden_imports = [
     "src.hitl.storage",
     "src.hitl.overlay_render",
     "src.hitl.batch_runner",
+    "src.hitl.db",
 ]
 
 # Skip large optional dependencies that the HITL editor never imports.

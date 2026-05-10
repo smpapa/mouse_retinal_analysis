@@ -5,7 +5,7 @@
 
 ## 한 줄 요약
 
-`batch_process.py`가 96장의 OCT TIFF를 분석해 `oct_results.xlsx`와 자동 overlay PNG를 만들고, HITL 에디터(`python -m src.hitl.main`)는 사용자가 boundary를 직접 수정해 같은 xlsx에 `*_corrected` 컬럼으로 저장한다. 자동 컬럼은 절대 손상되지 않고, 보정된 컬럼이 있으면 그것이 최종 측정값이 된다.
+`batch_process.py`가 96장의 OCT TIFF를 분석해 `oct_results.xlsx`와 자동 overlay PNG를 만들고, HITL 에디터(`python -m src.hitl.main`)는 그 xlsx를 한 번 SQLite DB(`output/db/oct_results.db`)로 import한 뒤 모든 편집을 DB에 저장한다(~5ms). 종료 시 또는 `File > Export to Excel`을 누르면 DB에서 xlsx를 다시 만들어낸다. xlsx 형식은 기존(`*_corrected` 컬럼 + `corrected_summary` 시트)과 동일.
 
 ---
 
