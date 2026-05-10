@@ -69,6 +69,7 @@ python -m src.hitl.main --workbook <path>.xlsx --image-dir <data_folder>
 | `File > Open Data Folder...` | 폴더 선택 → `output/oct_results.xlsx` 있으면 로드, 없으면 자동 분석 실행 여부 묻기. 미저장 변경이 있으면 Save/Discard/Cancel 프롬프트 |
 | `File > Save` | `Ctrl+S` 동일. 현재 이미지 저장 |
 | `Tools > Run Auto Analysis...` | 현재 폴더에 `batch_process.batch_run`을 백그라운드 워커 스레드로 실행. 진행 상황은 `QProgressDialog`로 표시. 완료 시 워크북 자동 reload |
+| `Tools > Export Annotations (CSV + TIFF)...` | ✓ 표시된 (사용자가 보정한) 이미지들만 골라 CSV 표 + Heidelberg-색상 annotation TIFF로 출력. 출력 폴더 선택 다이얼로그 → `<chosen>/csv/<stem>.csv`, `<chosen>/tiff/<stem>_annotation_hitl.tiff`. ML 학습 / `gt_guided.py` 검증용 |
 
 ---
 
@@ -245,4 +246,5 @@ MainWindow
 | `src/hitl/boundary_toggle.py` | `BoundaryToggleBar` — 5개 boundary 가시성 체크박스 |
 | `src/hitl/overlay_render.py` | 보정 boundary로 `_overlay_corrected.png` 렌더 (`viz.save_overlay` 재사용) |
 | `src/hitl/batch_runner.py` | `BatchWorker` — `Tools > Run Auto Analysis`가 사용하는 `QThread` 워커. `batch_process.batch_run`을 GUI 스레드 밖에서 실행하고 진행 상황을 시그널로 보고 |
-| `tests/hitl/` | 60+ 테스트 (storage / boundary_model / canvas / sidebar / app / overlay_render) |
+| `src/hitl/export_annotations.py` | `Tools > Export Annotations`가 사용하는 어노테이션 내보내기. 보정된 이미지를 CSV (학습용 표) + Heidelberg-호환 annotation TIFF (`gt_guided.py` 검증용)로 출력 |
+| `tests/hitl/` | 60+ 테스트 (storage / boundary_model / canvas / sidebar / app / overlay_render / db / export_annotations) |

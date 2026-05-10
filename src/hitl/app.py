@@ -26,6 +26,7 @@ from .boundary_model import (BOUNDARY_NAMES, BoundaryEditor,
 from .boundary_toggle import BoundaryToggleBar                      # noqa: E402
 from .canvas import EditMode, OverlayCanvas                         # noqa: E402
 from .db import HitlDb                                               # noqa: E402
+from .export_annotations import export_annotations                   # noqa: E402
 from .overlay_render import render_corrected_overlay                # noqa: E402
 from .sidebar import FileEntry, FileListView                        # noqa: E402
 from .storage import CorrectedSnapshot                              # noqa: E402
@@ -47,6 +48,36 @@ class _ExportWorker(QObject):
             self.finished.emit(str(result))
         except Exception as e:
             self.error.emit(str(e))
+
+
+class _AnnotationExportWorker(QObject):
+    """Background-thread worker that runs export_annotations()."""
+    progress = Signal(int, int, str)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, db, image_dir, out_dir, formats, only_corrected):
+        super().__init__()
+        self.db = db
+        self.image_dir = image_dir
+        self.out_dir = out_dir
+        self.formats = formats
+        self.only_corrected = only_corrected
+
+    def run(self):
+        try:
+            result = export_annotations(
+                self.db, self.image_dir, self.out_dir,
+                formats=self.formats,
+                only_corrected=self.only_corrected,
+                progress_callback=self._on_progress,
+            )
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _on_progress(self, i, n, name):
+        self.progress.emit(int(i), int(n), str(name))
 
 
 class MainWindow(QMainWindow):
@@ -176,6 +207,14 @@ class MainWindow(QMainWindow):
         self.act_run_batch = QAction("&Run Auto Analysis...", self)
         self.act_run_batch.triggered.connect(self._run_auto_analysis)
         tools_menu.addAction(self.act_run_batch)
+        tools_menu.addSeparator()
+        self.act_export_annotations = QAction(
+            "Export Annotations (CSV + TIFF)...", self
+        )
+        self.act_export_annotations.triggered.connect(
+            self._export_annotations
+        )
+        tools_menu.addAction(self.act_export_annotations)
 
     def _setup_shortcuts(self) -> None:
         # Boundary picker shortcuts: 1..5 select active boundary.
@@ -397,6 +436,107 @@ class MainWindow(QMainWindow):
         editor.undo()
         self.canvas.refresh()
         self._refresh_status()
+
+    def _export_annotations(self) -> None:
+        """Tools > Export Annotations: write CSV + annotation TIFF for
+        every image that has user corrections (✓ in the sidebar).
+
+        Output structure:
+            <chosen_dir>/
+              csv/<stem>.csv
+              tiff/<stem>_annotation_hitl.tiff
+        """
+        if self._db is None:
+            QMessageBox.information(
+                self, "Nothing to export",
+                "Open a data folder first.",
+            )
+            return
+        n_corr = sum(1 for _, _, has in self._db.list_images() if has)
+        if n_corr == 0:
+            QMessageBox.information(
+                self, "No corrections yet",
+                "None of the images have user corrections. Edit a few "
+                "boundaries and Save first, then come back.",
+            )
+            return
+        # Default output: <workbook_path.parent>/annotations/
+        default = self.workbook_path.parent / "annotations"
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Choose annotation output folder", str(default)
+        )
+        if not chosen:
+            return
+        out_dir = Path(chosen)
+
+        # Spawn worker on a QThread; show progress dialog while it runs.
+        progress = QProgressDialog(
+            f"Exporting annotations for {n_corr} corrected image(s)...",
+            None, 0, n_corr, self,
+        )
+        progress.setWindowTitle("Export Annotations")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+        QApplication.processEvents()
+
+        loop = QEventLoop()
+        thread = QThread(self)
+        worker = _AnnotationExportWorker(
+            self._db, self.image_dir, out_dir,
+            formats={"csv", "tiff"},
+            only_corrected=True,
+        )
+        worker.moveToThread(thread)
+
+        result_holder: dict = {"ok": False, "result": None, "err": None}
+
+        def on_progress(i: int, n: int, name: str):
+            progress.setMaximum(n)
+            progress.setValue(i)
+            progress.setLabelText(f"[{i}/{n}] {name}")
+
+        def on_finished(result: dict):
+            result_holder["ok"] = True
+            result_holder["result"] = result
+            loop.quit()
+
+        def on_error(msg: str):
+            result_holder["ok"] = False
+            result_holder["err"] = msg
+            loop.quit()
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        thread.started.connect(worker.run)
+        thread.start()
+        loop.exec()
+        thread.quit()
+        thread.wait()
+        progress.close()
+
+        if not result_holder["ok"]:
+            QMessageBox.critical(
+                self, "Export failed",
+                result_holder["err"] or "Unknown error",
+            )
+            return
+        r = result_holder["result"]
+        msg = (
+            f"Exported {r['csv_count']} CSV file(s) and "
+            f"{r['tiff_count']} annotation TIFF(s) to:\n{out_dir}"
+        )
+        if r.get("skipped_missing_tiff"):
+            msg += (f"\n\n{r['skipped_missing_tiff']} TIFF(s) skipped "
+                    "because the source image was not found in the "
+                    f"image folder ({self.image_dir}).")
+        QMessageBox.information(self, "Export complete", msg)
+        self.statusBar().showMessage(
+            f"Exported annotations to {out_dir}"
+        )
 
     def _export_to_xlsx(self) -> None:
         """File > Export to Excel — write the current DB state to xlsx."""
