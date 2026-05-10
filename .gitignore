@@ -22,6 +22,10 @@ __pycache__/
 .eggs/
 build/
 dist/
+# PyInstaller alternate output paths (e.g. when --distpath is used to
+# work around a Windows file lock during development).
+build*/
+dist*/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

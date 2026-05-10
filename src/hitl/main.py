@@ -13,7 +13,16 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .app import run
+# Two import paths:
+# - Normal CLI (`python -m src.hitl.main`): main.py runs as a package
+#   member, so the relative import works.
+# - PyInstaller standalone exe: main.py is loaded as `__main__` with no
+#   package context, so the relative import raises ImportError. Fall
+#   back to the absolute path that OctHitlEditor.spec puts on sys.path.
+try:
+    from .app import run
+except ImportError:
+    from src.hitl.app import run  # type: ignore[no-redef]
 
 
 def main() -> None:
