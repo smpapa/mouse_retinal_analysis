@@ -63,76 +63,79 @@ def load_rgb(path: str | Path) -> np.ndarray:
     return np.asarray(im, dtype=np.uint8)
 
 
-_GREY_LO = 30                # IR fundus pixels are mid-grey: in this range
-_GREY_HI = 150
-_IR_CIRCLE_FRAC = 0.30       # IR circle column = at least this fraction of
-                             # the column's max grey-pixel count (relative)
-_IR_GAP_TOL = 5              # tolerate breaks of this many cols within IR run
-_CUTOFF_DROP_MIN = 20        # 'sharp drop' in n_grey signifying the right
-                             # cut-off line of the IR circle
-_RETINAL_BAND_MIN = 200      # fallback: column where retinal band intensity
-                             # first exceeds this counts as B-scan start
+# Tunables for the dark-background-run detector below. Values picked
+# empirically against the project's mouse OCT corpus.
+_BG_DARK_THRESH = 30          # pixel < this counts as "near-black"
+_BG_FRAC_THRESH = 0.7         # column with this fraction of dark pixels
+                              # is considered B-scan-background-like
+_BG_MIN_RUN = 200             # B-scan panel always sustains at least
+                              # this many such columns
+_BG_GAP_TOL = 50              # bright gaps shorter than this don't break
+                              # a run (e.g. the bright retinal band can
+                              # raise frac_dark briefly inside the panel)
+_BG_SKIP_INITIAL = 100        # ignore short black image-borders at x<100
 
 
-def _ir_circle_right_edge(rgb: np.ndarray) -> int | None:
-    """Find the right cut-off edge of the IR fundus circle.
+def _bscan_left_edge_via_dark_bg(rgb: np.ndarray) -> int | None:
+    """Find the left edge of the B-scan panel.
 
-    The IR fundus is a circular grey image inscribed in a rectangular IR
-    panel. Per column, count pixels with mid-grey intensity (the fundus
-    signature). Inside the circle ``n_grey`` decreases gradually as the
-    circle narrows; at the cut-off line ``n_grey`` drops sharply.
+    Heuristic: the B-scan panel has an almost-black background dotted
+    with a few bright retinal layers — its columns are dominated by
+    near-black pixels. The IR fundus to its left has plenty of mid-grey
+    pixels and is far less dark per column. So the leftmost column of a
+    long sustained "almost-all-dark" run marks the start of the B-scan.
 
-    Detection (in priority order):
+    Edge cases handled:
+      - some scans have a black border at the very left of the image
+        before the IR fundus; we skip those (``_BG_SKIP_INITIAL``)
+      - the bright retinal band can briefly raise frac_dark above the
+        threshold inside the panel; we tolerate small bright gaps
+        (``_BG_GAP_TOL``) within a run
+      - dim intra-IR areas like the optic disc no longer fool us — they
+        used to make the previous mid-grey-based detector fire inside
+        the IR circle.
 
-    1. **Sharp-drop rule** — find the first column past the IR run where
-       ``n_grey`` falls by more than ``_CUTOFF_DROP_MIN`` from the previous
-       column. The cut-off is that column.
-    2. **Retinal-band fallback** — when no sharp drop is found (e.g. when
-       the circle fades very gradually), use the leftmost column where
-       the retinal bright band is clearly present (``col_max`` of the
-       upper-mid y range exceeds ``_RETINAL_BAND_MIN``).
-
-    Returns None if neither signal is found.
+    Returns None when no qualifying run is found.
     """
     gray = rgb.mean(axis=2)
     H, W = gray.shape
-    grey_mask = (gray >= _GREY_LO) & (gray <= _GREY_HI)
-    n_grey = grey_mask.sum(axis=0).astype(np.int32)
+    frac_dark = (gray < _BG_DARK_THRESH).mean(axis=0)
+    is_dark = frac_dark > _BG_FRAC_THRESH
 
-    if n_grey[:W // 2].size == 0 or int(n_grey[:W // 2].max()) == 0:
-        return None
-    max_n_grey = int(n_grey[:W // 2].max())
-    rel_thresh = _IR_CIRCLE_FRAC * max_n_grey
-    is_circle = n_grey > rel_thresh
-    if not is_circle.any():
-        return None
-    idx = np.where(is_circle)[0]
-    diffs = np.diff(idx)
-    gap_pos = np.where(diffs > _IR_GAP_TOL)[0]
-    if len(gap_pos) == 0:
-        ir_end = int(idx[-1])
-    else:
-        ir_end = int(idx[gap_pos[0]])
+    # Skip a short initial black border, if present.
+    start_scan = 0
+    if is_dark[0]:
+        non_dark = np.where(~is_dark[:_BG_SKIP_INITIAL])[0]
+        if len(non_dark):
+            start_scan = int(non_dark[0])
 
-    # 1. Sharp-drop rule: walk forward from a few cols before ir_end and
-    #    find the first column whose backward drop exceeds the threshold.
-    search_lo = max(0, ir_end - 5)
-    search_hi = min(W - 1, ir_end + 30)
-    for x in range(search_lo, search_hi):
-        if int(n_grey[x]) - int(n_grey[x + 1]) > _CUTOFF_DROP_MIN:
-            return x + 1
+    # Scan forward for the first sustained dark-background run.
+    run_start = -1
+    run_end = -1
+    bright_gap = 0
+    for x in range(start_scan, W):
+        if is_dark[x]:
+            if run_start == -1:
+                run_start = x
+            run_end = x
+            bright_gap = 0
+        else:
+            if run_start != -1:
+                bright_gap += 1
+                if bright_gap > _BG_GAP_TOL:
+                    if run_end - run_start + 1 >= _BG_MIN_RUN:
+                        return run_start
+                    run_start = -1
+                    run_end = -1
+                    bright_gap = 0
+    if run_start != -1 and run_end - run_start + 1 >= _BG_MIN_RUN:
+        return run_start
+    return None
 
-    # 2. Retinal-band fallback: leftmost column past ir_end with a strong
-    #    bright peak in the retinal y range.
-    upper = int(H * 0.15)
-    lower = int(H * 0.55)
-    for x in range(ir_end, W):
-        col_max_band = float(gray[upper:lower, x].max())
-        col_med = float(np.median(gray[:, x]))
-        if col_max_band > _RETINAL_BAND_MIN and col_med < 30:
-            return x
 
-    return ir_end
+# Public name kept for backwards compatibility (was previously the
+# mid-grey-circle approach; see git history for the old logic).
+_ir_circle_right_edge = _bscan_left_edge_via_dark_bg
 
 
 def detect_bscan_layout(rgb: np.ndarray) -> BscanLayout:
