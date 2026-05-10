@@ -497,8 +497,12 @@ class MainWindow(QMainWindow):
         )
         if not original_dir:
             return
-        # Output folder.
-        default_out = legacy_dir.parent / "annotation_hitl"
+        # Output folder. Default to the same canonical location the
+        # editor's "Export Annotations" writes to and that
+        # gt_guided.find_annotation looks in:
+        #   <image_dir>/output/annotations/tiff/
+        default_out = self.image_dir / "output" / "annotations" / "tiff"
+        default_out.mkdir(parents=True, exist_ok=True)
         out_chosen = QFileDialog.getExistingDirectory(
             self, "Choose output folder for converted TIFFs",
             str(default_out),

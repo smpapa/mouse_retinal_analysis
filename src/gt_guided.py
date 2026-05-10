@@ -227,14 +227,24 @@ def compare(pred, gt: GTBoundaries) -> dict[str, float]:
 
 
 def find_annotation(image_path: str | Path) -> Optional[Path]:
-    """Locate the matching annotation TIFF if one exists."""
+    """Locate the matching annotation TIFF if one exists.
+
+    Looks only in the HITL-canonical folder
+    ``<parent>/output/annotations/tiff/<stem>_annotation_hitl.{tiff,tif}``.
+
+    The legacy ``<parent>/annotation/<stem>_annotation.tiff`` location
+    is intentionally ignored — once the project has been through HITL,
+    those legacy files duplicate the canonical HITL-coloured versions
+    and only cause confusion. Convert legacy files to HITL colours via
+    the editor's "Tools > Convert Legacy Annotation TIFFs to HITL
+    Colours..." menu before relying on them.
+    """
     p = Path(image_path)
-    cand = p.parent / "annotation" / (p.stem + "_annotation.tiff")
-    if cand.exists():
-        return cand
-    cand2 = p.parent / "annotation" / (p.stem + "_annotation.tif")
-    if cand2.exists():
-        return cand2
+    hitl_dir = p.parent / "output" / "annotations" / "tiff"
+    for ext in (".tiff", ".tif"):
+        cand = hitl_dir / f"{p.stem}_annotation_hitl{ext}"
+        if cand.exists():
+            return cand
     return None
 
 

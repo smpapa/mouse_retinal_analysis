@@ -70,7 +70,9 @@ python -m src.hitl.main --workbook <path>.xlsx --image-dir <data_folder>
 | `File > Save` | `Ctrl+S` 동일. 현재 이미지 저장 |
 | `Tools > Run Auto Analysis...` | 현재 폴더에 `batch_process.batch_run`을 백그라운드 워커 스레드로 실행. 진행 상황은 `QProgressDialog`로 표시. 완료 시 워크북 자동 reload |
 | `Tools > Export Annotations (CSV + TIFF)...` | ✓ 표시된 (사용자가 보정한) 이미지들만 골라 CSV 표 + HITL-색상 annotation TIFF로 출력. 출력 폴더 선택 다이얼로그 → `<chosen>/csv/<stem>.csv`, `<chosen>/tiff/<stem>_annotation_hitl.tiff`. ML 학습 / `gt_guided.py` 검증용. TIFF의 boundary 색상은 HITL 캔버스의 색상(빨강 TOP / 초록 ONL / 파랑 BM / 노랑 DET top / 마젠타 DET bot)과 동일 |
-| `Tools > Convert Legacy Annotation TIFFs to HITL Colours...` | 기존 Heidelberg-색상 annotation TIFF (4H/6H 등)를 HITL 색상으로 일괄 변환. 입력 폴더(`annotation/`) + 원본 TIFF 폴더 + 출력 폴더 선택. 결과 파일명 `<stem>_annotation_hitl.tiff`. 변환 후 `gt_guided.py`가 동일 마스크로 모든 annotation을 처리 가능 |
+| `Tools > Convert Legacy Annotation TIFFs to HITL Colours...` | 기존 Heidelberg-색상 annotation TIFF (4H/6H 등)를 HITL 색상으로 일괄 변환. 입력 폴더(`annotation/`) + 원본 TIFF 폴더 + 출력 폴더 선택. 기본 출력은 `<image_dir>/output/annotations/tiff/`로 — `gt_guided.find_annotation`이 보는 위치와 일치 (`Export Annotations` 메뉴와도 같음). 결과 파일명 `<stem>_annotation_hitl.tiff` |
+
+**`gt_guided.find_annotation`의 검색 위치**: `<image_dir>/output/annotations/tiff/<stem>_annotation_hitl.{tiff,tif}` 만 본다. 기존 `<image_dir>/annotation/` 폴더는 의도적으로 무시 — HITL을 거친 후엔 색상이 다를 뿐 같은 데이터의 중복본이라 헷갈림. 변환 안 된 legacy 파일이 있으면 위 메뉴로 변환하면 자동으로 canonical 위치에 들어가 batch_process가 사용함.
 
 ---
 
