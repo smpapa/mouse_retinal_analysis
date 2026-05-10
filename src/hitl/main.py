@@ -30,10 +30,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Both paths are allowed to be missing — the editor opens with an
+    # empty sidebar and the user picks a folder via File > Open Data
+    # Folder. We just print a notice so the user knows what happened.
     if not args.workbook.exists():
-        raise SystemExit(f"Workbook not found: {args.workbook}")
+        print(f"Notice: workbook not found at {args.workbook}; "
+              "use File > Open Data Folder to load one.")
     if not args.image_dir.exists():
-        raise SystemExit(f"Image dir not found: {args.image_dir}")
+        print(f"Notice: image dir not found at {args.image_dir}; "
+              "use File > Open Data Folder to load one.")
     run(args.workbook, args.image_dir)
 
 

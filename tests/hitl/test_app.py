@@ -165,3 +165,32 @@ def test_mainwindow_select_image_sets_panel_geometry(qtbot, tmp_path,
     assert win.canvas._panel_right_x is not None
     assert win.canvas._panel_left_x < win.canvas._panel_right_x
     assert len(win.canvas._panel_marker_items) == 3
+
+
+def test_mainwindow_has_open_and_run_batch_actions(qtbot, tmp_path,
+                                                    oct_results_xlsx,
+                                                    sample_image_stem):
+    """File > Open Data Folder and Tools > Run Auto Analysis menu items
+    must exist and be wired."""
+    import shutil as _sh
+    dst = tmp_path / "oct_results.xlsx"
+    _sh.copy(oct_results_xlsx, dst)
+    win = MainWindow(workbook_path=dst, image_dir=oct_results_xlsx.parent.parent)
+    qtbot.addWidget(win)
+    assert hasattr(win, "act_open")
+    assert hasattr(win, "act_run_batch")
+    # Menubar should contain "File" and "Tools" actions.
+    menubar_titles = [a.text() for a in win.menuBar().actions()]
+    assert "&File" in menubar_titles
+    assert "&Tools" in menubar_titles
+
+
+def test_mainwindow_constructs_with_missing_workbook_path(qtbot, tmp_path):
+    """MainWindow should not crash when given a path that does not exist;
+    the user can pick a folder via File > Open Data Folder."""
+    fake = tmp_path / "does_not_exist.xlsx"
+    win = MainWindow(workbook_path=fake, image_dir=tmp_path)
+    qtbot.addWidget(win)
+    # No editors, no current image — but the window built successfully.
+    assert win._wb is None
+    assert win.sidebar.count() == 0

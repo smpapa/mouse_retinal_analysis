@@ -134,7 +134,14 @@ def _make_unique(name: str, used: set[str]) -> str:
     return out
 
 
-def batch_run(folder: str | Path, output_dir: str | Path) -> Path:
+def batch_run(folder: str | Path, output_dir: str | Path,
+              progress_callback=None) -> Path:
+    """Analyze every TIFF in `folder`; write results to `output_dir`.
+
+    `progress_callback`, if given, is called as `progress_callback(i, n, name)`
+    before each image is processed (1-based `i`). Useful for GUI progress
+    bars; pass `None` for a silent run.
+    """
     folder = Path(folder).resolve()
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -153,6 +160,11 @@ def batch_run(folder: str | Path, output_dir: str | Path) -> Path:
     used_sheet_names: set[str] = set()
 
     for i, p in enumerate(images, 1):
+        if progress_callback is not None:
+            try:
+                progress_callback(i, len(images), p.name)
+            except Exception:
+                pass  # Never let a UI bug abort the batch.
         try:
             summary, df, sheet_name = _process_one(p, output_dir)
         except Exception as exc:

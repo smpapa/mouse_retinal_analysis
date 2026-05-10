@@ -9,13 +9,19 @@
 
 ---
 
-## 단계 1 — 자동 분석 (사전 작업, batch_process.py)
+## 단계 1 — 자동 분석
 
-HITL을 띄우기 전에 한 번 실행:
+두 가지 방법:
+
+**(a) CLI로 사전 실행** — HITL 띄우기 전:
 
 ```bash
-python -m src.batch_process
+python -m src.batch_process <data_folder>
 ```
+
+**(b) HITL 에디터 안에서 실행** — `Tools > Run Auto Analysis`
+
+이 메뉴는 현재 선택된 데이터 폴더 (또는 `File > Open Data Folder`로 막 고른 폴더)에 대해 `batch_process.batch_run`을 백그라운드 워커 스레드(`BatchWorker`)로 실행한다. 진행 상황은 `QProgressDialog`로 표시 (`[i/N] filename.tif`). 완료되면 결과 워크북이 자동으로 다시 로드되어 사이드바에 96개 파일이 채워진다.
 
 처리 내용:
 
@@ -42,16 +48,27 @@ python -m src.batch_process
 
 ```bash
 python -m src.hitl.main
+# 옵션:
+python -m src.hitl.main --workbook <path>.xlsx --image-dir <data_folder>
 ```
 
 `MainWindow.__init__`:
 
-1. `storage.load_workbook(oct_results.xlsx)` — 96개 시트를 모두 읽어 메모리에 적재
+1. 인자로 받은 `workbook_path`가 존재하면 `storage.load_workbook(oct_results.xlsx)` — 96개 시트를 모두 읽어 메모리에 적재
    - `summary` 시트의 `filename` 컬럼으로 `stem → sheet_name` 매핑 구축 (sheet name이 28자로 truncate되어 있으므로)
    - 각 이미지마다 `ImageRecord(stem, filename, width, auto={5개 boundary 배열}, corrected={5개 보정 배열})`
    - 이미 `*_corrected` 컬럼이 있으면 (이전 세션 작업물) 함께 로드. `"ERASED"` 문자열 셀은 `ERASED_MARKER (-1e9)`로 변환
-2. UI 빌드: 좌측 dock에 파일리스트 + boundary 체크박스, 중앙에 `OverlayCanvas`, 툴바에 Drag/Erase/Undo/Save
-3. 사이드바에 96개 파일 표시 (이미 보정된 파일에는 `✓` 표시)
+2. 워크북이 없으면 빈 사이드바로 시작 — `File > Open Data Folder`로 폴더를 골라 로드
+3. UI 빌드: 메뉴바 (`File`, `Tools`), 좌측 dock에 파일리스트 + boundary 체크박스, 중앙에 `OverlayCanvas`, 툴바에 Drag/Erase/Undo/Save
+4. 사이드바에 96개 파일 표시 (이미 보정된 파일에는 `✓` 표시)
+
+**메뉴 동작**:
+
+| 메뉴 항목 | 동작 |
+|---|---|
+| `File > Open Data Folder...` | 폴더 선택 → `output/oct_results.xlsx` 있으면 로드, 없으면 자동 분석 실행 여부 묻기. 미저장 변경이 있으면 Save/Discard/Cancel 프롬프트 |
+| `File > Save` | `Ctrl+S` 동일. 현재 이미지 저장 |
+| `Tools > Run Auto Analysis...` | 현재 폴더에 `batch_process.batch_run`을 백그라운드 워커 스레드로 실행. 진행 상황은 `QProgressDialog`로 표시. 완료 시 워크북 자동 reload |
 
 ---
 
@@ -227,4 +244,5 @@ MainWindow
 | `src/hitl/sidebar.py` | `FileListView` — `QListWidget`, ✓ 표시, 선택 시그널 |
 | `src/hitl/boundary_toggle.py` | `BoundaryToggleBar` — 5개 boundary 가시성 체크박스 |
 | `src/hitl/overlay_render.py` | 보정 boundary로 `_overlay_corrected.png` 렌더 (`viz.save_overlay` 재사용) |
+| `src/hitl/batch_runner.py` | `BatchWorker` — `Tools > Run Auto Analysis`가 사용하는 `QThread` 워커. `batch_process.batch_run`을 GUI 스레드 밖에서 실행하고 진행 상황을 시그널로 보고 |
 | `tests/hitl/` | 60+ 테스트 (storage / boundary_model / canvas / sidebar / app / overlay_render) |

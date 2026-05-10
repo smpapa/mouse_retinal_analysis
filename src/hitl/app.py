@@ -6,11 +6,11 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
-from PySide6.QtWidgets import (QApplication, QDockWidget, QMainWindow,
-                                QMessageBox, QStatusBar, QToolBar,
-                                QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QDockWidget, QFileDialog,
+                                QMainWindow, QMessageBox, QProgressDialog,
+                                QStatusBar, QToolBar, QVBoxLayout, QWidget)
 
 # Make sibling analysis modules importable.
 SRC = Path(__file__).resolve().parents[1]
@@ -19,6 +19,7 @@ if str(SRC) not in sys.path:
 
 from io_utils import load_oct                                       # noqa: E402
 
+from .batch_runner import BatchWorker                                # noqa: E402
 from .boundary_model import (BOUNDARY_NAMES, BoundaryEditor,
                               ERASED_THRESHOLD)                      # noqa: E402
 from .boundary_toggle import BoundaryToggleBar                      # noqa: E402
@@ -41,9 +42,17 @@ class MainWindow(QMainWindow):
         # When True, _on_sidebar_image_selected skips the unsaved-changes
         # prompt — used for programmatic reverts after the user cancels.
         self._suppress_dirty_check: bool = False
+        # Batch-run worker state. Held as instance attrs so the QThread
+        # outlives the method scope; cleared after batch completes.
+        self._batch_thread: QThread | None = None
+        self._batch_worker: BatchWorker | None = None
+        self._progress_dialog: QProgressDialog | None = None
 
         self._build_ui()
-        self._reload_workbook()
+        # If a real workbook exists, load it. Otherwise leave the UI empty
+        # so the user can pick a folder via File > Open Data Folder.
+        if self.workbook_path.exists():
+            self._reload_workbook()
 
     def _build_ui(self) -> None:
         self.setWindowTitle("OCT HITL Editor")
@@ -104,7 +113,26 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.act_save)
 
         self._setup_shortcuts()
+        self._build_menu_bar()
         self.setStatusBar(QStatusBar(self))
+
+    def _build_menu_bar(self) -> None:
+        """File / Tools menus driving folder selection + auto analysis."""
+        menubar = self.menuBar()
+
+        file_menu = menubar.addMenu("&File")
+        self.act_open = QAction("&Open Data Folder...", self)
+        self.act_open.setShortcut(QKeySequence.Open)
+        self.act_open.triggered.connect(self._open_data_folder)
+        file_menu.addAction(self.act_open)
+        file_menu.addSeparator()
+        # Reuse the toolbar's Save action so its shortcut and label match.
+        file_menu.addAction(self.act_save)
+
+        tools_menu = menubar.addMenu("&Tools")
+        self.act_run_batch = QAction("&Run Auto Analysis...", self)
+        self.act_run_batch.triggered.connect(self._run_auto_analysis)
+        tools_menu.addAction(self.act_run_batch)
 
     def _setup_shortcuts(self) -> None:
         # Boundary picker shortcuts: 1..5 select active boundary.
@@ -295,6 +323,173 @@ class MainWindow(QMainWindow):
         editor.undo()
         self.canvas.refresh()
         self._refresh_status()
+
+    # ------------------------------------------------------ data folder
+
+    def _open_data_folder(self) -> None:
+        """Prompt the user for a TIFF folder and switch to it.
+
+        If an `output/oct_results.xlsx` already exists in that folder we
+        load it directly; otherwise offer to run auto analysis.
+        """
+        start = str(self.image_dir if self.image_dir.exists() else Path.home())
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select OCT data folder", start
+        )
+        if not folder:
+            return
+        folder = Path(folder)
+        # The folder must contain at least one TIFF for the editor to be
+        # useful. Glob silently to keep this method fast.
+        tiffs = list(folder.glob("*.tif")) + list(folder.glob("*.tiff"))
+        if not tiffs:
+            QMessageBox.warning(
+                self, "No TIFFs found",
+                f"No .tif/.tiff files in {folder}.",
+            )
+            return
+        workbook_path = folder / "output" / "oct_results.xlsx"
+        if workbook_path.exists():
+            self._switch_data_folder(folder, workbook_path)
+            return
+        # No analysis yet — offer to run it now.
+        reply = QMessageBox.question(
+            self, "No analysis found",
+            f"No oct_results.xlsx found in:\n{workbook_path.parent}\n\n"
+            f"Found {len(tiffs)} TIFF files in the folder.\n\n"
+            "Run auto analysis now?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        # Switch the in-memory paths first so _run_auto_analysis uses them,
+        # but skip _switch_data_folder's reload (the workbook does not
+        # exist yet).
+        self.image_dir = folder
+        self.workbook_path = workbook_path
+        self._editors.clear()
+        self._current_stem = None
+        self._run_auto_analysis()
+
+    def _switch_data_folder(self, image_dir: Path,
+                             workbook_path: Path) -> None:
+        """Update paths and reload, prompting first if any editor is dirty."""
+        dirty = [s for s, ed in self._editors.items() if ed.dirty]
+        if dirty:
+            n = len(dirty)
+            msg = (f"Save changes to {n} image(s) before switching folder?"
+                   if n > 1 else
+                   f"Save changes to {self._wb.images[dirty[0]].filename} "
+                   "before switching folder?")
+            reply = QMessageBox.question(
+                self, "Unsaved changes", msg,
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if reply == QMessageBox.Cancel:
+                return
+            if reply == QMessageBox.Save:
+                for stem in dirty:
+                    self._current_stem = stem
+                    self.save_current_image()
+                if any(ed.dirty for ed in self._editors.values()):
+                    return  # save failed — abort the switch
+        self.image_dir = Path(image_dir)
+        self.workbook_path = Path(workbook_path)
+        self._editors.clear()
+        self._current_stem = None
+        self._reload_workbook()
+        self.statusBar().showMessage(f"Loaded {self.workbook_path}")
+
+    # ----------------------------------------------------- batch runner
+
+    def _run_auto_analysis(self) -> None:
+        """Run batch_process.batch_run on the current folder in a worker."""
+        if not self.image_dir.exists():
+            QMessageBox.critical(
+                self, "No folder",
+                "No data folder selected. Use File > Open Data Folder.",
+            )
+            return
+        tiffs = list(self.image_dir.glob("*.tif")) + \
+                list(self.image_dir.glob("*.tiff"))
+        if not tiffs:
+            QMessageBox.critical(
+                self, "No TIFFs",
+                f"No .tif/.tiff files in {self.image_dir}.",
+            )
+            return
+        reply = QMessageBox.question(
+            self, "Run auto analysis",
+            f"Analyze {len(tiffs)} TIFF files in:\n{self.image_dir}\n\n"
+            "This may take several minutes. Existing automatic results "
+            "will be overwritten; *_corrected columns are preserved.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        if self._batch_thread is not None:
+            QMessageBox.information(
+                self, "Already running",
+                "An auto analysis run is already in progress.",
+            )
+            return
+        output_dir = self.image_dir / "output"
+        # Spin up a worker on its own QThread.
+        self._batch_thread = QThread(self)
+        self._batch_worker = BatchWorker(self.image_dir, output_dir)
+        self._batch_worker.moveToThread(self._batch_thread)
+        self._batch_thread.started.connect(self._batch_worker.run)
+        self._batch_worker.progress.connect(self._on_batch_progress)
+        self._batch_worker.finished.connect(self._on_batch_finished)
+        self._batch_worker.error.connect(self._on_batch_error)
+        # Modal progress dialog. Cancel currently does not interrupt the
+        # worker — it just hides the dialog; the run completes in the
+        # background. (Adding interruption would need cooperative checks
+        # in batch_run; out of scope.)
+        self._progress_dialog = QProgressDialog(
+            "Starting auto analysis...", None, 0, len(tiffs), self
+        )
+        self._progress_dialog.setWindowTitle("Auto Analysis")
+        self._progress_dialog.setWindowModality(Qt.WindowModal)
+        self._progress_dialog.setMinimumDuration(0)
+        self._progress_dialog.setValue(0)
+        self._batch_thread.start()
+
+    def _on_batch_progress(self, i: int, n: int, name: str) -> None:
+        if self._progress_dialog is None:
+            return
+        self._progress_dialog.setMaximum(n)
+        self._progress_dialog.setValue(i)
+        self._progress_dialog.setLabelText(f"[{i}/{n}] {name}")
+
+    def _cleanup_batch_worker(self) -> None:
+        if self._batch_thread is not None:
+            self._batch_thread.quit()
+            self._batch_thread.wait()
+            self._batch_thread = None
+        self._batch_worker = None
+        if self._progress_dialog is not None:
+            self._progress_dialog.close()
+            self._progress_dialog = None
+
+    def _on_batch_finished(self, xlsx_path: str) -> None:
+        self._cleanup_batch_worker()
+        self.workbook_path = Path(xlsx_path)
+        # Editors are stale after re-analysis; rebuild on next select.
+        self._editors.clear()
+        self._current_stem = None
+        self._reload_workbook()
+        QMessageBox.information(
+            self, "Done",
+            f"Auto analysis complete:\n{xlsx_path}",
+        )
+
+    def _on_batch_error(self, msg: str) -> None:
+        self._cleanup_batch_worker()
+        QMessageBox.critical(self, "Auto analysis failed", msg)
 
     def _prev_image(self) -> None:
         """Move sidebar selection up by one (clamped)."""
