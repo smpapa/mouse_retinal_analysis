@@ -22,6 +22,7 @@ from typing import Optional
 import numpy as np
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import (
+    QBrush,
     QColor,
     QImage,
     QMouseEvent,
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
     QGraphicsLineItem,
     QGraphicsPathItem,
     QGraphicsPixmapItem,
+    QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsView,
 )
@@ -96,7 +98,11 @@ class OverlayCanvas(QGraphicsView):
         # and three vertical marker lines mirror the automatic overlay.
         self._panel_left_x: Optional[int] = None
         self._panel_right_x: Optional[int] = None
+        self._panel_top_y: Optional[int] = None
+        self._panel_bot_y: Optional[int] = None
         self._panel_marker_items: list[QGraphicsLineItem] = []
+        # Visual erase rectangle drawn while the user sweeps in ERASE mode.
+        self._erase_rect_item: Optional[QGraphicsRectItem] = None
 
         self.editor: Optional[BoundaryEditor] = None
         self._active: Optional[str] = None
@@ -190,10 +196,53 @@ class OverlayCanvas(QGraphicsView):
             self.editor.end_paint()
             self.editor.end_drag()
         self._dragging = False
+        self._erase_start_x = None
+        self._erase_last_x = None
+        self._hide_erase_rect()
         if self._panning:
             self.unsetCursor()
             self._panning = False
             self._pan_last_pos = None
+
+    def _show_erase_rect(self, x_a: int, x_b: int) -> None:
+        """Draw (or update) the translucent red box that previews the
+        x-range about to be erased. Both ends are B-scan-local x indices."""
+        if self._panel_left_x is None or self._panel_right_x is None:
+            return
+        if self._panel_top_y is None or self._panel_bot_y is None:
+            return
+        # Map B-scan-local x to scene coordinates and clamp to the panel.
+        offset = self._image_offset_x
+        x1 = min(x_a, x_b) + offset
+        x2 = max(x_a, x_b) + offset + 1   # +1 so inclusive end is visible
+        x1 = max(self._panel_left_x, x1)
+        x2 = min(self._panel_right_x + 1, x2)
+        if x2 <= x1:
+            self._hide_erase_rect()
+            return
+        rect_x = float(x1)
+        rect_y = float(self._panel_top_y)
+        rect_w = float(x2 - x1)
+        rect_h = float(self._panel_bot_y - self._panel_top_y + 1)
+        if self._erase_rect_item is None:
+            pen = QPen(QColor(255, 60, 60))
+            pen.setWidthF(1.5)
+            pen.setCosmetic(True)
+            brush = QBrush(QColor(255, 60, 60, 60))  # alpha = 60/255
+            item = QGraphicsRectItem(rect_x, rect_y, rect_w, rect_h)
+            item.setPen(pen)
+            item.setBrush(brush)
+            item.setZValue(20)  # above boundary lines (z=10)
+            self._scene.addItem(item)
+            self._erase_rect_item = item
+        else:
+            self._erase_rect_item.setRect(rect_x, rect_y, rect_w, rect_h)
+            self._erase_rect_item.setVisible(True)
+
+    def _hide_erase_rect(self) -> None:
+        if self._erase_rect_item is not None:
+            self._scene.removeItem(self._erase_rect_item)
+            self._erase_rect_item = None
 
     # --------------------------------------------------------- headless hooks
 
@@ -263,6 +312,7 @@ class OverlayCanvas(QGraphicsView):
                     self._erase_start_x = x
                     self._erase_last_x = x
                     self._dragging = True
+                    self._show_erase_rect(x, x)
                     return
         super().mousePressEvent(event)
 
@@ -301,6 +351,10 @@ class OverlayCanvas(QGraphicsView):
             elif self._mode is EditMode.ERASE:
                 if 0 <= x < self.editor.width:
                     self._erase_last_x = x
+                if (self._erase_start_x is not None
+                        and self._erase_last_x is not None):
+                    self._show_erase_rect(self._erase_start_x,
+                                            self._erase_last_x)
                 return
         super().mouseMoveEvent(event)
 
@@ -328,6 +382,7 @@ class OverlayCanvas(QGraphicsView):
             self._dragging = False
             self._erase_start_x = None
             self._erase_last_x = None
+            self._hide_erase_rect()
             self._refresh_lines()
             self.edit_finished.emit()
             return
@@ -415,6 +470,8 @@ class OverlayCanvas(QGraphicsView):
         """
         self._panel_left_x = int(left_x)
         self._panel_right_x = int(right_x)
+        self._panel_top_y = int(top_y)
+        self._panel_bot_y = int(bot_y)
         # Remove any previous marker items.
         for item in self._panel_marker_items:
             self._scene.removeItem(item)

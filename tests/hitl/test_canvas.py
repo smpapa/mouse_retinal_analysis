@@ -218,3 +218,39 @@ def test_canvas_hovered_signal_emits_local_x(qtbot, editor):
     assert received == [50]
     canvas.hovered.emit(-1)
     assert received == [50, -1]
+
+
+def test_canvas_show_erase_rect_creates_item(qtbot, editor):
+    """_show_erase_rect should add a QGraphicsRectItem to the scene
+    while a sweep is active, and _hide_erase_rect should remove it."""
+    img = np.zeros((300, 200, 3), dtype=np.uint8)
+    canvas = OverlayCanvas()
+    qtbot.addWidget(canvas)
+    canvas.set_image(img)
+    canvas.set_editor(editor)
+    canvas.set_panel_geometry(left_x=20, right_x=180,
+                               top_y=10, bot_y=290, center_x=100)
+    assert canvas._erase_rect_item is None
+    canvas._show_erase_rect(30, 50)
+    assert canvas._erase_rect_item is not None
+    rect = canvas._erase_rect_item.rect()
+    # Width should match the swept range (roughly).
+    assert rect.width() > 0
+    canvas._hide_erase_rect()
+    assert canvas._erase_rect_item is None
+
+
+def test_canvas_show_erase_rect_clamps_to_panel(qtbot, editor):
+    """If the user sweeps outside the panel, the rect must clamp."""
+    img = np.zeros((300, 200, 3), dtype=np.uint8)
+    canvas = OverlayCanvas()
+    qtbot.addWidget(canvas)
+    canvas.set_image(img)
+    canvas.set_editor(editor)
+    canvas.set_panel_geometry(left_x=50, right_x=150,
+                               top_y=10, bot_y=290, center_x=100)
+    # Sweep way outside on both sides; rect should clamp to [50, 151).
+    canvas._show_erase_rect(-200, 999)
+    rect = canvas._erase_rect_item.rect()
+    assert rect.left() >= 50
+    assert rect.right() <= 152  # inclusive panel right_x + 1
