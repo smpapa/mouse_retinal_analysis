@@ -66,50 +66,57 @@ def load_rgb(path: str | Path) -> np.ndarray:
 # Tunables for the dark-background-run detector below. Values picked
 # empirically against the project's mouse OCT corpus.
 _BG_DARK_THRESH = 30          # pixel < this counts as "near-black"
-_BG_FRAC_THRESH = 0.7         # column with this fraction of dark pixels
-                              # is considered B-scan-background-like
+_BG_ROUGH_FRAC = 0.7          # column with this fraction of dark pixels
+                              # qualifies for the rough run-search
 _BG_MIN_RUN = 200             # B-scan panel always sustains at least
                               # this many such columns
 _BG_GAP_TOL = 50              # bright gaps shorter than this don't break
-                              # a run (e.g. the bright retinal band can
-                              # raise frac_dark briefly inside the panel)
+                              # a rough run (e.g. the bright retinal band
+                              # can raise frac_dark briefly inside the panel)
 _BG_SKIP_INITIAL = 100        # ignore short black image-borders at x<100
+_BG_REFINE_FRAC = 0.85        # the actual IR/B-scan clip line is where
+                              # frac_dark sustains > this — a tighter
+                              # threshold than the rough scan above
+_BG_REFINE_WINDOW = 30        # max columns to walk forward from the
+                              # rough start when refining
 
 
 def _bscan_left_edge_via_dark_bg(rgb: np.ndarray) -> int | None:
     """Find the left edge of the B-scan panel.
 
-    Heuristic: the B-scan panel has an almost-black background dotted
-    with a few bright retinal layers — its columns are dominated by
-    near-black pixels. The IR fundus to its left has plenty of mid-grey
-    pixels and is far less dark per column. So the leftmost column of a
-    long sustained "almost-all-dark" run marks the start of the B-scan.
+    Two-stage heuristic:
 
-    Edge cases handled:
-      - some scans have a black border at the very left of the image
-        before the IR fundus; we skip those (``_BG_SKIP_INITIAL``)
-      - the bright retinal band can briefly raise frac_dark above the
-        threshold inside the panel; we tolerate small bright gaps
-        (``_BG_GAP_TOL``) within a run
-      - dim intra-IR areas like the optic disc no longer fool us — they
-        used to make the previous mid-grey-based detector fire inside
-        the IR circle.
+    1. **Rough**: locate the leftmost sustained run of "mostly dark"
+       columns (``frac_dark > 0.7`` for at least 200 columns, ignoring
+       small bright gaps and short leading image borders). The B-scan
+       panel always satisfies this — the IR fundus to its left has
+       plenty of mid-grey pixels and never sustains such a long
+       almost-all-dark run.
+
+    2. **Refine**: walk forward from the rough start (within 30 cols)
+       to the first column where ``frac_dark >= 0.85``. The IR fundus
+       circle's right edge is **clipped vertically** by the panel
+       boundary; that clip line shows up as a sharp jump in frac_dark
+       (~0.79 -> ~0.95 over a couple of columns). The rough threshold
+       0.7 catches the gradual edge of the IR circle a few columns
+       too early; the refine threshold 0.85 lands precisely on the
+       clip line.
 
     Returns None when no qualifying run is found.
     """
     gray = rgb.mean(axis=2)
     H, W = gray.shape
     frac_dark = (gray < _BG_DARK_THRESH).mean(axis=0)
-    is_dark = frac_dark > _BG_FRAC_THRESH
+    is_dark = frac_dark > _BG_ROUGH_FRAC
 
-    # Skip a short initial black border, if present.
+    # ---- Stage 1: rough — first sustained dark-background run.
     start_scan = 0
     if is_dark[0]:
         non_dark = np.where(~is_dark[:_BG_SKIP_INITIAL])[0]
         if len(non_dark):
             start_scan = int(non_dark[0])
 
-    # Scan forward for the first sustained dark-background run.
+    rough = None
     run_start = -1
     run_end = -1
     bright_gap = 0
@@ -124,13 +131,23 @@ def _bscan_left_edge_via_dark_bg(rgb: np.ndarray) -> int | None:
                 bright_gap += 1
                 if bright_gap > _BG_GAP_TOL:
                     if run_end - run_start + 1 >= _BG_MIN_RUN:
-                        return run_start
+                        rough = run_start
+                        break
                     run_start = -1
                     run_end = -1
                     bright_gap = 0
-    if run_start != -1 and run_end - run_start + 1 >= _BG_MIN_RUN:
-        return run_start
-    return None
+    if rough is None:
+        if run_start != -1 and run_end - run_start + 1 >= _BG_MIN_RUN:
+            rough = run_start
+        else:
+            return None
+
+    # ---- Stage 2: refine to the actual clip line.
+    hi = min(W, rough + _BG_REFINE_WINDOW)
+    for x in range(rough, hi):
+        if frac_dark[x] >= _BG_REFINE_FRAC:
+            return x
+    return rough  # fallback if the sharp clip never materialises
 
 
 # Public name kept for backwards compatibility (was previously the
