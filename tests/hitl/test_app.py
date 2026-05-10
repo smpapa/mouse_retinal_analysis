@@ -194,3 +194,25 @@ def test_mainwindow_constructs_with_missing_workbook_path(qtbot, tmp_path):
     # No editors, no current image — but the window built successfully.
     assert win._wb is None
     assert win.sidebar.count() == 0
+
+
+def test_mainwindow_hover_label_updates_on_canvas_hover(qtbot, tmp_path,
+                                                        oct_results_xlsx,
+                                                        sample_image_stem):
+    """When the canvas emits hovered(x), the status bar label shows
+    per-column TOP/ONL/BM/total/outer values."""
+    import shutil as _sh
+    dst = tmp_path / "oct_results.xlsx"
+    _sh.copy(oct_results_xlsx, dst)
+    win = MainWindow(workbook_path=dst, image_dir=oct_results_xlsx.parent.parent)
+    qtbot.addWidget(win)
+    win.select_image(sample_image_stem)
+    # Simulate a hover at column 100.
+    win.canvas.hovered.emit(100)
+    text = win._hover_label.text()
+    assert "x=100" in text
+    assert "TOP=" in text
+    assert "BM=" in text
+    # Out-of-panel hover clears the label.
+    win.canvas.hovered.emit(-1)
+    assert win._hover_label.text() == ""

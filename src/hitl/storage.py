@@ -155,28 +155,15 @@ def _read_corrected_column(ws, col_idx: int, n_rows: int) -> np.ndarray:
     return out
 
 
-def save_corrections(path: str | Path,
-                     snapshots: list[CorrectedSnapshot],
-                     scale_um_per_px_y: float) -> None:
-    """Write user corrections to the workbook.
+def apply_corrections_inplace(wb,
+                               snapshots: list[CorrectedSnapshot],
+                               scale_um_per_px_y: float) -> None:
+    """Mutate an in-memory openpyxl Workbook with the given snapshots.
 
-    For each snapshot:
-      - Update the per-image sheet with `<name>_corrected` columns and
-        the recomputed thickness columns.
-      - ERASED_MARKER in `corrected` is written as the literal string
-        `"ERASED"` so spreadsheets stay human-readable.
-      - Append/update a row in `corrected_summary`.
-
-    Uses openpyxl in-place mutation so untouched sheets are not rewritten
-    — important when the workbook has 96 sheets and the user saves often.
-    The write is atomic: we serialize to a sibling `.tmp` file and then
-    `os.replace()` it over the target.
+    Splits the work that ``save_corrections`` does so the caller can
+    cache the workbook between saves (avoiding the ~10 s reload cost on
+    a 96-sheet xlsx) and run the disk flush on a background thread.
     """
-    from openpyxl import load_workbook as _openpyxl_load
-    p = Path(path)
-
-    wb = _openpyxl_load(str(p))
-
     # Build stem -> sheet_name map by walking the summary sheet's
     # `filename` column in order. The batch pipeline writes detail sheets
     # in matching order, so we zip them together.
@@ -361,8 +348,38 @@ def save_corrections(path: str | Path,
                 for j, h in enumerate(cs_headers, start=1):
                     cs.cell(row=ri, column=j, value=srow[h])
 
-    # Atomic write: save to .tmp, then os.replace.
+
+
+def save_workbook_atomic(wb, path: str | Path) -> None:
+    """Serialize an in-memory openpyxl Workbook to disk atomically.
+
+    Writes to ``<path>.tmp`` first, then ``os.replace`` over the target
+    so a crash mid-write cannot corrupt the user's xlsx.
+    """
+    p = Path(path)
     tmp = p.with_suffix(p.suffix + ".tmp")
     wb.save(str(tmp))
-    wb.close()
     os.replace(str(tmp), str(p))
+
+
+def save_corrections(path: str | Path,
+                     snapshots: list[CorrectedSnapshot],
+                     scale_um_per_px_y: float,
+                     wb=None) -> None:
+    """Apply ``snapshots`` to the workbook and save to disk atomically.
+
+    If ``wb`` is None, the workbook is loaded fresh from ``path``; this
+    is the path tests and one-off CLI use take. The HITL editor caches
+    the workbook between saves and passes it via ``wb=`` to skip the
+    ~10 s reload cost on a 96-sheet xlsx.
+    """
+    from openpyxl import load_workbook as _openpyxl_load
+    own_wb = (wb is None)
+    if own_wb:
+        wb = _openpyxl_load(str(path))
+    try:
+        apply_corrections_inplace(wb, snapshots, scale_um_per_px_y)
+        save_workbook_atomic(wb, path)
+    finally:
+        if own_wb:
+            wb.close()

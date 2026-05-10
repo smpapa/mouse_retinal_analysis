@@ -69,6 +69,10 @@ class OverlayCanvas(QGraphicsView):
     # Emitted after a user edit completes (drag end or erase apply) so
     # external observers (e.g. the main window status bar) can refresh.
     edit_finished = Signal()
+    # Emitted on every mouse move with the B-scan-local x column under
+    # the cursor (or -1 when the cursor is outside the panel). Used by
+    # the main window to show per-column measurements in the status bar.
+    hovered = Signal(int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -273,9 +277,20 @@ class OverlayCanvas(QGraphicsView):
             vbar.setValue(vbar.value() - delta.y())
             event.accept()
             return
+        # Always emit the hover signal so the status bar can show per-
+        # column measurements regardless of drag state.
+        scene_pt = self.mapToScene(event.position().toPoint())
+        x_local = int(round(scene_pt.x() - self._image_offset_x))
+        if (self.editor is not None
+                and 0 <= x_local < self.editor.width
+                and self._panel_left_x is not None
+                and self._panel_left_x <= scene_pt.x() <= self._panel_right_x + 1):
+            self.hovered.emit(x_local)
+        else:
+            self.hovered.emit(-1)
+
         if self._dragging and self.editor is not None and self._active is not None:
-            scene_pt = self.mapToScene(event.position().toPoint())
-            x = int(round(scene_pt.x() - self._image_offset_x))
+            x = x_local
             y = float(scene_pt.y())
             if self._mode is EditMode.DRAG:
                 # Paint-trace: write every column between the previous and

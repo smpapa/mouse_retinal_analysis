@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (QApplication, QDockWidget, QFileDialog,
-                                QMainWindow, QMessageBox, QProgressDialog,
-                                QStatusBar, QToolBar, QVBoxLayout, QWidget)
+                                QLabel, QMainWindow, QMessageBox,
+                                QProgressDialog, QStatusBar, QToolBar,
+                                QVBoxLayout, QWidget)
 
 # Make sibling analysis modules importable.
 SRC = Path(__file__).resolve().parents[1]
@@ -30,6 +32,26 @@ from .storage import (CorrectedSnapshot, Workbook,
                       load_workbook, save_corrections)              # noqa: E402
 
 
+class _SaveWorker(QObject):
+    """Background-thread worker that flushes a cached openpyxl Workbook
+    to disk via the storage helpers."""
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(self, wb, path):
+        super().__init__()
+        self.wb = wb
+        self.path = path
+
+    def run(self):
+        try:
+            from .storage import save_workbook_atomic
+            save_workbook_atomic(self.wb, self.path)
+            self.finished.emit()
+        except Exception as e:
+            self.error.emit(f"{e}\n\n{traceback.format_exc()}")
+
+
 class MainWindow(QMainWindow):
     def __init__(self, workbook_path, image_dir):
         super().__init__()
@@ -47,6 +69,16 @@ class MainWindow(QMainWindow):
         self._batch_thread: QThread | None = None
         self._batch_worker: BatchWorker | None = None
         self._progress_dialog: QProgressDialog | None = None
+        # Cached openpyxl workbook (loaded lazily on first save) so we
+        # don't pay the ~10 s reload cost every Ctrl+S. Invalidated when
+        # the user switches data folders.
+        self._openpyxl_wb = None
+        # Background save state.
+        self._save_thread: QThread | None = None
+        self._save_worker = None
+        self._save_in_flight: bool = False
+        self._pending_snapshots: list = []  # of CorrectedSnapshot
+        self._currently_saving_stems: list[str] = []
 
         self._build_ui()
         # If a real workbook exists, load it. Otherwise leave the UI empty
@@ -115,6 +147,14 @@ class MainWindow(QMainWindow):
         self._setup_shortcuts()
         self._build_menu_bar()
         self.setStatusBar(QStatusBar(self))
+        # Persistent hover label (rightmost in the status bar). Updated
+        # whenever the canvas reports the column under the cursor; the
+        # transient showMessage() text on the left of the status bar is
+        # untouched.
+        self._hover_label = QLabel("")
+        self._hover_label.setStyleSheet("padding-right: 8px;")
+        self.statusBar().addPermanentWidget(self._hover_label)
+        self.canvas.hovered.connect(self._on_canvas_hover)
 
     def _build_menu_bar(self) -> None:
         """File / Tools menus driving folder selection + auto analysis."""
@@ -267,42 +307,26 @@ class MainWindow(QMainWindow):
         self._refresh_status()
 
     def save_current_image(self) -> None:
+        """Queue the current image's edits for an asynchronous flush.
+
+        UI feedback is immediate: sidebar gains the ✓ marker and the PNG
+        is rendered up-front. The slow xlsx write happens on a background
+        thread so the user can move to the next image right away.
+        """
         if self._current_stem is None:
             return
         editor = self._editors[self._current_stem]
         snap = CorrectedSnapshot(
             stem=self._current_stem,
-            corrected={k: editor.corrected[k].copy() for k in editor.corrected},
+            corrected={k: editor.corrected[k].copy()
+                       for k in editor.corrected},
             timestamp=datetime.now(),
         )
-        try:
-            save_corrections(self.workbook_path, [snap],
-                             scale_um_per_px_y=self._scale_y)
-        except (PermissionError, OSError) as e:
-            # Clean up any leftover .tmp from a partial write before the
-            # atomic rename had a chance to run.
-            tmp = self.workbook_path.with_suffix(
-                self.workbook_path.suffix + ".tmp")
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
-            QMessageBox.critical(
-                self, "Save failed",
-                f"Could not write {self.workbook_path.name}.\n\n"
-                f"If Excel has the file open, close it and try again.\n\n"
-                f"Details: {e}",
-            )
-            return
-        # Sidebar marker reflects xlsx state immediately.
+        self._pending_snapshots.append(snap)
+        # Optimistic UI: sidebar ✓ + render PNG immediately. mark_clean
+        # is deferred until the worker confirms the disk write so a
+        # failure leaves the editor dirty for retry.
         self.sidebar.mark_corrected(self._current_stem, True)
-        editor.mark_clean()
-        self._refresh_status()
-        # Render PNG separately — failure is non-fatal so the user does
-        # not lose their save state if rendering hits an edge case.
-        # Note: self._wb may go slightly stale after save; full reload
-        # only on next app launch.
         rec = self._wb.images[self._current_stem]
         try:
             img_path = self.image_dir / rec.filename
@@ -312,9 +336,101 @@ class MainWindow(QMainWindow):
             render_corrected_overlay(img_path, boundaries, out_path)
         except Exception as e:
             self.statusBar().showMessage(
-                f"Saved {rec.filename} (overlay PNG failed: {e})")
+                f"Save queued for {rec.filename} (overlay PNG failed: {e})")
+        else:
+            self.statusBar().showMessage(f"Saving {rec.filename}...")
+        # Kick off the disk flush if no save is currently in flight.
+        if not self._save_in_flight:
+            self._kick_save_cycle()
+
+    def _kick_save_cycle(self) -> None:
+        """Apply queued snapshots to the cached workbook and spawn a
+        background thread to flush it to disk. Caller must guarantee
+        no save is currently in flight."""
+        if not self._pending_snapshots:
             return
-        self.statusBar().showMessage(f"Saved {rec.filename}")
+        from openpyxl import load_workbook as _openpyxl_load
+        from .storage import apply_corrections_inplace, save_workbook_atomic
+
+        snaps = self._pending_snapshots[:]
+        self._pending_snapshots.clear()
+        # Lazy-load the openpyxl workbook on first save; reused after.
+        if self._openpyxl_wb is None:
+            try:
+                self._openpyxl_wb = _openpyxl_load(str(self.workbook_path))
+            except Exception as e:
+                QMessageBox.critical(self, "Save failed",
+                                      f"Could not open workbook: {e}")
+                return
+        # Apply mutations to the in-memory workbook on the main thread
+        # (the worker only reads it). This is fast (~50 ms per snap).
+        try:
+            apply_corrections_inplace(
+                self._openpyxl_wb, snaps, self._scale_y,
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed",
+                                  f"Could not apply corrections: {e}")
+            return
+        # Spawn the background flush.
+        self._save_in_flight = True
+        self._currently_saving_stems = [s.stem for s in snaps]
+        self._save_thread = QThread(self)
+        self._save_worker = _SaveWorker(self._openpyxl_wb,
+                                          self.workbook_path)
+        self._save_worker.moveToThread(self._save_thread)
+        self._save_thread.started.connect(self._save_worker.run)
+        self._save_worker.finished.connect(self._on_save_finished)
+        self._save_worker.error.connect(self._on_save_error)
+        self._save_thread.start()
+
+    def _on_save_finished(self) -> None:
+        # Mark editors clean now that the disk write completed.
+        for stem in self._currently_saving_stems:
+            ed = self._editors.get(stem)
+            if ed is not None:
+                ed.mark_clean()
+        if self._save_thread is not None:
+            self._save_thread.quit()
+            self._save_thread.wait()
+        self._save_thread = None
+        self._save_worker = None
+        self._save_in_flight = False
+        stems = self._currently_saving_stems
+        self._currently_saving_stems = []
+        if stems:
+            last = stems[-1]
+            rec = self._wb.images.get(last) if self._wb else None
+            label = rec.filename if rec is not None else last
+            self.statusBar().showMessage(f"Saved {label}")
+        self._refresh_status()
+        # Process anything queued during the just-finished flush.
+        if self._pending_snapshots:
+            self._kick_save_cycle()
+
+    def _on_save_error(self, msg: str) -> None:
+        # Clean up any leftover .tmp from a partial write.
+        tmp = self.workbook_path.with_suffix(
+            self.workbook_path.suffix + ".tmp")
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        if self._save_thread is not None:
+            self._save_thread.quit()
+            self._save_thread.wait()
+        self._save_thread = None
+        self._save_worker = None
+        self._save_in_flight = False
+        self._currently_saving_stems = []
+        self.statusBar().showMessage("Save failed")
+        QMessageBox.critical(
+            self, "Save failed",
+            f"Could not write {self.workbook_path.name}.\n\n"
+            f"If Excel has the file open, close it and try again.\n\n"
+            f"Details: {msg}",
+        )
 
     def _undo(self) -> None:
         if self._current_stem is None:
@@ -393,14 +509,41 @@ class MainWindow(QMainWindow):
                 for stem in dirty:
                     self._current_stem = stem
                     self.save_current_image()
+                # Wait for any background save to complete before switch.
+                self._wait_for_save()
                 if any(ed.dirty for ed in self._editors.values()):
                     return  # save failed — abort the switch
         self.image_dir = Path(image_dir)
         self.workbook_path = Path(workbook_path)
         self._editors.clear()
         self._current_stem = None
+        # Discard cached openpyxl workbook so the new folder loads fresh.
+        if self._openpyxl_wb is not None:
+            try:
+                self._openpyxl_wb.close()
+            except Exception:
+                pass
+        self._openpyxl_wb = None
         self._reload_workbook()
         self.statusBar().showMessage(f"Loaded {self.workbook_path}")
+
+    def _wait_for_save(self, timeout_ms: int = 60_000) -> bool:
+        """Block until the background save thread (if any) completes.
+
+        Returns True on success, False on timeout.
+        """
+        if self._save_thread is None:
+            return True
+        # Process events while waiting so the worker's finished signal
+        # gets dispatched on the main thread.
+        from PySide6.QtCore import QCoreApplication
+        deadline = timeout_ms
+        step = 50
+        while self._save_in_flight and deadline > 0:
+            QCoreApplication.processEvents()
+            QThread.msleep(step)
+            deadline -= step
+        return not self._save_in_flight
 
     # ----------------------------------------------------- batch runner
 
@@ -478,9 +621,16 @@ class MainWindow(QMainWindow):
     def _on_batch_finished(self, xlsx_path: str) -> None:
         self._cleanup_batch_worker()
         self.workbook_path = Path(xlsx_path)
-        # Editors are stale after re-analysis; rebuild on next select.
+        # Editors and the cached openpyxl workbook are stale after
+        # re-analysis (the on-disk xlsx changed); rebuild from scratch.
         self._editors.clear()
         self._current_stem = None
+        if self._openpyxl_wb is not None:
+            try:
+                self._openpyxl_wb.close()
+            except Exception:
+                pass
+        self._openpyxl_wb = None
         self._reload_workbook()
         QMessageBox.information(
             self, "Done",
@@ -534,9 +684,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if reply == QMessageBox.Save:
-            # Save each dirty image. If any save fails (e.g. PermissionError
-            # surfaced via QMessageBox in save_current_image), abort close
-            # so the user can address the failure.
+            # Queue saves for each dirty image, then block until the
+            # background worker finishes flushing.
             for stem in dirty_stems:
                 self._current_stem = stem
                 try:
@@ -544,12 +693,58 @@ class MainWindow(QMainWindow):
                 except Exception:
                     event.ignore()
                     return
-            # If any editor is still dirty (save_current_image returned
-            # early after a write error), abort the close.
+            # save_current_image is async — wait for the worker.
+            self._wait_for_save()
             if any(ed.dirty for ed in self._editors.values()):
                 event.ignore()
                 return
+        else:  # Discard
+            # Even on discard, wait for any in-flight save so we don't
+            # tear down the workbook mid-write.
+            self._wait_for_save()
         super().closeEvent(event)
+
+    def _on_canvas_hover(self, x_local: int) -> None:
+        """Update the rightmost status-bar label with per-column readings."""
+        if x_local < 0 or self._current_stem is None:
+            self._hover_label.setText("")
+            return
+        editor = self._editors.get(self._current_stem)
+        if editor is None:
+            self._hover_label.setText("")
+            return
+
+        def fmt(v) -> str:
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                return "—"
+            return f"{int(round(float(v)))}"
+
+        eff = {n: editor.effective(n)[x_local] for n in BOUNDARY_NAMES}
+        parts = [f"x={x_local}",
+                 f"TOP={fmt(eff['TOP_y'])}",
+                 f"ONL={fmt(eff['ONL_y'])}",
+                 f"BM={fmt(eff['BM_y'])}"]
+        # DET pair only when at least the top is finite.
+        det_top = eff["DET_top_y"]
+        det_bot = eff["DET_bottom_y"]
+        if not (isinstance(det_top, float) and np.isnan(det_top)):
+            parts.append(f"DET=({fmt(det_top)},{fmt(det_bot)})")
+        # Thicknesses (μm) — only when both endpoints are finite.
+        scale = self._scale_y
+        bm = eff["BM_y"]
+        top = eff["TOP_y"]
+        onl = eff["ONL_y"]
+
+        def finite(v) -> bool:
+            return not (isinstance(v, float) and np.isnan(v))
+
+        if finite(bm) and finite(top):
+            parts.append(f"total={(bm - top) * scale:.1f}μm")
+        if finite(bm) and finite(onl):
+            parts.append(f"outer={(bm - onl) * scale:.1f}μm")
+        if finite(det_top) and finite(det_bot):
+            parts.append(f"det={(det_bot - det_top) * scale:.1f}μm")
+        self._hover_label.setText("  |  ".join(parts))
 
     def _refresh_status(self) -> None:
         """Rebuild the status bar message with edited boundaries + dirty marker."""
