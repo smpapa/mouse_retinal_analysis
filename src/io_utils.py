@@ -150,9 +150,59 @@ def _bscan_left_edge_via_dark_bg(rgb: np.ndarray) -> int | None:
     return rough  # fallback if the sharp clip never materialises
 
 
+def _bscan_left_edge_via_green_markers(rgb: np.ndarray) -> int | None:
+    """Find the panel left edge from Heidelberg's green scan-position
+    markers drawn on the IR fundus.
+
+    The IR fundus shows green horizontal lines (Heidelberg's per-scan
+    markers). Each line spans most of the IR panel width and is
+    cleanly clipped at the IR panel's right edge — which is exactly
+    the B-scan panel's left edge. Per row, count pure-green pixels
+    ((G > 200) & (R < 50) & (B < 50)); rows with > 50 such pixels are
+    "scan rows". The rightmost column in the left half of the image
+    that has any green from a scan row is the clip line.
+
+    Returns None when no scan-position markers are found (e.g. for
+    images that omit them).
+    """
+    H, W, _ = rgb.shape
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    green_mask = (G > 200) & (R < 50) & (B < 50)
+    row_green_count = green_mask.sum(axis=1)
+    is_scan_row = row_green_count > 50
+    if not is_scan_row.any():
+        return None
+    half = W // 2
+    scan_in_left = green_mask[is_scan_row][:, :half]
+    col_has_green = scan_in_left.any(axis=0)
+    sig_cols = np.where(col_has_green)[0]
+    if len(sig_cols) == 0:
+        return None
+    return int(sig_cols[-1]) + 1
+
+
+def _bscan_left_edge(rgb: np.ndarray) -> int | None:
+    """Find the panel left edge.
+
+    Two signals, in priority order:
+
+    1. **Green Heidelberg scan-position markers** — most reliable.
+       Each marker is a long horizontal green line clipped exactly at
+       the IR panel's right edge. Used when the image has scan markers.
+    2. **Dark background run** — fallback for images without markers.
+       The B-scan panel's column-wise dark-pixel fraction jumps from
+       ~0.5 inside the IR area to ~0.85+ at the clip line (see
+       ``_bscan_left_edge_via_dark_bg`` for details).
+    """
+    edge = _bscan_left_edge_via_green_markers(rgb)
+    if edge is not None:
+        return edge
+    return _bscan_left_edge_via_dark_bg(rgb)
+
+
 # Public name kept for backwards compatibility (was previously the
 # mid-grey-circle approach; see git history for the old logic).
-_ir_circle_right_edge = _bscan_left_edge_via_dark_bg
+_ir_circle_right_edge = _bscan_left_edge
 
 
 def detect_bscan_layout(rgb: np.ndarray) -> BscanLayout:
