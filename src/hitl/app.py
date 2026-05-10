@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import QEventLoop, QObject, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (QApplication, QDockWidget, QFileDialog,
                                 QLabel, QMainWindow, QMessageBox,
@@ -29,6 +29,24 @@ from .db import HitlDb                                               # noqa: E40
 from .overlay_render import render_corrected_overlay                # noqa: E402
 from .sidebar import FileEntry, FileListView                        # noqa: E402
 from .storage import CorrectedSnapshot                              # noqa: E402
+
+
+class _ExportWorker(QObject):
+    """Background-thread worker that runs HitlDb.export_to_xlsx."""
+    finished = Signal(str)   # path that was written
+    error = Signal(str)
+
+    def __init__(self, db, out_path):
+        super().__init__()
+        self.db = db
+        self.out_path = out_path
+
+    def run(self):
+        try:
+            result = self.db.export_to_xlsx(self.out_path)
+            self.finished.emit(str(result))
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class MainWindow(QMainWindow):
@@ -397,13 +415,69 @@ class MainWindow(QMainWindow):
         )
         if not dst:
             return
-        try:
-            self._db.export_to_xlsx(dst)
-        except Exception as e:
-            QMessageBox.critical(self, "Export failed", str(e))
+        ok, err = self._run_export_with_progress(
+            dst,
+            label_text=f"Exporting to Excel:\n{Path(dst).name}\n\n"
+                       "Writing all sheets — this can take ~10 seconds.",
+            window_title="Exporting",
+        )
+        if not ok:
+            QMessageBox.critical(self, "Export failed", err or "")
             return
         self._edits_since_export = False
         self.statusBar().showMessage(f"Exported {dst}")
+
+    def _run_export_with_progress(self, out_path,
+                                    label_text: str,
+                                    window_title: str = "Exporting"
+                                    ) -> tuple[bool, str | None]:
+        """Run db.export_to_xlsx on a worker thread; show a busy progress
+        dialog while it runs. Returns (success, error_message).
+
+        Blocks via a local QEventLoop until the worker emits finished or
+        error, so the caller can treat this as a synchronous operation
+        even though the actual save is on another thread (keeping the
+        Qt event loop responsive — the dialog re-paints, the cancel
+        button stays clickable).
+        """
+        if self._db is None:
+            return False, "No DB"
+        progress = QProgressDialog(label_text, None,  # no cancel button
+                                     0, 0, self)
+        progress.setWindowTitle(window_title)
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+        QApplication.processEvents()  # ensure dialog paints before we block
+
+        loop = QEventLoop()
+        thread = QThread(self)
+        worker = _ExportWorker(self._db, out_path)
+        worker.moveToThread(thread)
+
+        result: dict = {"ok": False, "err": None}
+
+        def on_finished(path: str):
+            result["ok"] = True
+            loop.quit()
+
+        def on_error(msg: str):
+            result["ok"] = False
+            result["err"] = msg
+            loop.quit()
+
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        thread.started.connect(worker.run)
+        thread.start()
+        loop.exec()
+
+        thread.quit()
+        thread.wait()
+        progress.close()
+        return result["ok"], result["err"]
 
     # ------------------------------------------------------ data folder
 
@@ -644,15 +718,20 @@ class MainWindow(QMainWindow):
         # closed without edits, so closing is instant in that case.
         if (self._db is not None and self._edits_since_export
                 and self._db.has_corrections()):
-            try:
-                self._db.export_to_xlsx(self.workbook_path)
-            except Exception as e:
+            ok, err = self._run_export_with_progress(
+                self.workbook_path,
+                label_text=("Saving changes to Excel before close:\n"
+                            f"{Path(self.workbook_path).name}\n\n"
+                            "This usually takes ~10 seconds."),
+                window_title="Saving",
+            )
+            if not ok:
                 # Don't block close on a failed export — DB is still
                 # canonical and the user can re-export from File menu.
                 QMessageBox.warning(
                     self, "Auto-export failed",
                     "DB is saved, but xlsx auto-export failed:\n"
-                    f"{e}\n\n"
+                    f"{err}\n\n"
                     "Use File > Export to Excel later to retry."
                 )
         if self._db is not None:
