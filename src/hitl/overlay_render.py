@@ -59,6 +59,10 @@ def render_corrected_overlay(image_path: str | Path,
     image_path : path to the source TIFF.
     boundaries : dict with keys ``TOP_y / ONL_y / BM_y / DET_top_y / DET_bottom_y``.
                  Missing keys are treated as all-NaN.
+                 **Values are absolute image y coordinates** — the same
+                 convention `batch_process.py` uses when it writes the
+                 xlsx (`to_abs(y_relative) = y_relative + layout.top_y`)
+                 and what the HITL editor stores in its DB.
     out_path   : destination PNG path. Parent directories will be created.
 
     Returns
@@ -67,17 +71,25 @@ def render_corrected_overlay(image_path: str | Path,
     """
     img = load_oct(image_path)
     w = img.layout.width
+    top_y = img.layout.top_y
 
     fitted = {k: _fit_to_width(boundaries.get(k), w) for k in BOUNDARY_NAMES}
 
-    has_det = bool(np.any(np.isfinite(fitted["DET_top_y"])))
+    # `viz.save_overlay` expects B-scan-relative y values (it adds
+    # layout.top_y itself). Our caller hands us absolute y, so subtract
+    # top_y. NaN survives the subtraction unchanged.
+    relative = {
+        k: (v - top_y).astype(np.float32) for k, v in fitted.items()
+    }
+
+    has_det = bool(np.any(np.isfinite(relative["DET_top_y"])))
 
     b = BoundaryResult(
-        TOP=fitted["TOP_y"],
-        ONL=fitted["ONL_y"],
-        BM=fitted["BM_y"],
-        DET_top=fitted["DET_top_y"],
-        DET_bottom=fitted["DET_bottom_y"],
+        TOP=relative["TOP_y"],
+        ONL=relative["ONL_y"],
+        BM=relative["BM_y"],
+        DET_top=relative["DET_top_y"],
+        DET_bottom=relative["DET_bottom_y"],
         has_detachment=has_det,
         center_x_local=img.layout.center_x - img.layout.left_x,
     )

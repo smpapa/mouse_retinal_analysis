@@ -102,6 +102,10 @@ def _write_annotation_tiff(tiff_src: Path,
     Draws only 1-pixel boundary lines on top of the original image —
     no panel decorations, no center marker — to keep the colour
     extraction in gt_guided clean.
+
+    `effective` y values are **absolute image coordinates** (same
+    convention the xlsx and DB use). They are written directly to the
+    canvas without re-adding layout.top_y.
     """
     img = load_oct(tiff_src)
     canvas = img.rgb.copy()
@@ -116,7 +120,7 @@ def _write_annotation_tiff(tiff_src: Path,
             if np.isnan(y_local):
                 continue
             x = layout.left_x + int(x_local)
-            y = layout.top_y + int(round(float(y_local)))
+            y = int(round(float(y_local)))   # already absolute
             if 0 <= y < h and 0 <= x < w:
                 canvas[y, x] = color
 
