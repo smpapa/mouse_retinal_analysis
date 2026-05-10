@@ -179,29 +179,168 @@ data\mouse_data_org\
 
 ## 7. 측정값 해석
 
-### 두께 (μm 단위)
-| 측정값 | 정의 |
-|---|---|
-| `total` | (BM y) − (TOP y) × scale = 망막 전체 두께 |
-| `outer` | (BM y) − (ONL y) × scale = 외망막 두께 |
-| `det` | (DET bot y) − (DET top y) × scale = detachment 두께 |
+### 7.1 축척 (Scale, μm per pixel)
 
-scale = `3.87 µm/px` (이 데이터셋의 Heidelberg 마우스 OCT 기준)
+OCT 이미지의 픽셀 좌표를 실제 길이(μm)로 변환하는 비율. Heidelberg가 OCT 이미지에 그려놓은 **200 μm 표시 막대** (B-scan 패널 좌하단의 흰 세로 막대 + "200 μm" 텍스트)가 기준점.
 
-### 자동값 vs 보정값
-xlsx 시트에서:
-- `TOP_y`, `ONL_y` 등 = **자동 검출값** (불변)
-- `TOP_y_corrected` 등 = **사용자 보정값** (있으면 이게 최종)
-- `total_thickness_um` = 자동 두께
-- `total_thickness_um_corrected` = 보정 반영 두께 (최종 측정)
+#### 현재 사용 값 (이 데이터셋)
 
-분석 시 항상 `*_corrected` 컬럼이 비어있지 않으면 그 값을, 비어있으면 `*` 컬럼 값을 사용.
+| 축 | 값 | 의미 |
+|---|---|---|
+| `scale_um_per_px_y` | **3.87 μm/px** | Y축 (boundary 깊이 방향) — 두께 계산용 |
+| `scale_um_per_px_x` | **11.50 μm/px** | X축 (스캔 방향) — 컬럼간 거리 계산용 |
+| `scale_source` | **fallback** | in-image 자동 검출 실패 시 기본값 사용 중 |
 
-`corrected_summary` 시트에 이미지별 `mean_total_um` (자동) vs `mean_total_um_corrected` (보정 후) 비교 표시.
+> **주의**: 96장 모두 fallback 값 적용 중. Heidelberg 마우스 OCT 표준값이라 모든 이미지가 동일 디바이스로 촬영된 경우 정확함. 다른 디바이스/해상도가 섞이면 측정값에 일률 오차 발생 가능.
+
+#### 검출 로직 (`io_utils.detect_scale`)
+
+1. 패널 우측 60px strip에서 짧은 가로 tick 검출 → 간격 측정 → 200 μm / 간격
+2. 실패 시 `FALLBACK_UM_PER_PX_Y = 3.87` 사용
+
+#### 축척이 측정값에 미치는 영향
+
+모든 두께 측정값은 단순 곱셈:
+```
+total_thickness_um = (BM_y − TOP_y) × scale_um_per_px_y
+```
+즉 scale이 10% 다르면 모든 두께도 10% 다름. 동일 디바이스 데이터라면 비교 (예: A vs B 그룹)는 영향 없음. 절대값 보고 시 주의.
+
+### 7.2 두께 측정 공식
+
+| 측정값 | 공식 | 의미 |
+|---|---|---|
+| `total_thickness_um` | (BM_y − TOP_y) × scale | 망막 전체 두께 |
+| `outer_thickness_um` | (BM_y − ONL_y) × scale | 외망막 두께 (ONL~BM) |
+| `detachment_thickness_um` | (DET_bot_y − DET_top_y) × scale | Detachment 영역 두께 |
+
+NaN인 컬럼은 측정 불가 → 평균 계산 시 제외 (`np.nanmean`).
+
+### 7.3 자동값 vs 보정값
+
+| 컬럼 종류 | 의미 | 사용 |
+|---|---|---|
+| `TOP_y` 등 | 자동 검출 (불변) | 보정 안 한 컬럼의 fallback |
+| `TOP_y_corrected` 등 | 사용자 보정값 | **있으면 이게 최종** |
+| `total_thickness_um` | 자동 두께 | 보정 안 한 컬럼만 의미 있음 |
+| `total_thickness_um_corrected` | 보정 반영 두께 | **최종 측정값** |
+
+**Effective 값** 결정 규칙 (per column):
+- `*_corrected` 셀이 빈 칸 → `*` (자동값) 사용
+- 숫자 → 보정값 사용
+- `"ERASED"` 문자열 → NaN (측정 불가)
+
+분석 시 always check `*_corrected` first.
 
 ---
 
-## 8. 자주 쓰는 시나리오
+## 8. Excel 파일 구조 (`oct_results.xlsx`)
+
+`File > Export to Excel...` 또는 종료 시 자동 export로 생성. 최종 분석에 사용.
+
+### 8.1 시트 구성
+
+```
+oct_results.xlsx
+├── summary                          ← 96장 한눈에 (이미지별 1행)
+├── 21_OS_4H                         ← 이미지별 상세 (per-column data)
+├── 21_OS_4H(1)
+├── ...                              (96개)
+└── corrected_summary                ← 보정 통계 (보정한 이미지만)
+```
+
+### 8.2 `summary` 시트 (96 rows × 약 20 columns)
+
+| 컬럼 | 의미 |
+|---|---|
+| `filename` | TIFF 파일명 (예: `21_OS_4H.tif`) |
+| `filename_says_normal` | 파일명 기반 추정 (4H/4V → True, 그 외 → False) — 참고용 |
+| `has_detachment` | 자동 검출이 detachment 영역 발견 여부 |
+| `n_measurable_cols` | total_thickness 계산 가능한 컬럼 수 (≤1535) |
+| `mean_total_thickness_um` | 자동 검출 망막 두께 평균 (μm) |
+| `mean_outer_thickness_um` | 자동 검출 외망막 두께 평균 |
+| `mean_detachment_thickness_um` | 자동 검출 detachment 두께 평균 (없으면 NaN) |
+| `scale_um_per_px_y` | 픽셀당 μm (Y축) |
+| `scale_um_per_px_x` | 픽셀당 μm (X축) |
+| `scale_source` | `"in_image"` 또는 `"fallback"` |
+| `bscan_left_x`, `right_x`, `top_y`, `bot_y` | B-scan 패널 좌표 |
+| `center_x` | 패널 중심 컬럼 |
+| `TOP_median_err_px` 등 (선택) | annotation TIFF가 있는 경우만 — GT와 자동 검출 차이 (median \|Δy\|) |
+
+### 8.3 이미지별 상세 시트 (예: `21_OS_4H` 시트, 1535 rows × 약 22 columns)
+
+각 행 = 한 컬럼(x_local 0..1534)의 측정값.
+
+#### 자동 검출 (불변)
+| 컬럼 | 단위 | 의미 |
+|---|---|---|
+| `x` | px | 이미지 절대 x 좌표 (= left_x + x_local) |
+| `x_local` | px | B-scan 패널 내 x (0..1534) |
+| `relative_x_px` | px | 패널 중심으로부터 거리 (음수 = 좌측) |
+| `relative_x_um` | μm | 위 값 × scale_x |
+| `TOP_y` | px | 망막 상단 y (절대 좌표) |
+| `ONL_y` | px | 외핵층 경계 y |
+| `BM_y` | px | Bruch 막 y |
+| `DET_top_y` | px | Detachment 상단 y (없으면 빈 칸) |
+| `DET_bottom_y` | px | Detachment 하단 y |
+| `total_thickness_um` | μm | (BM − TOP) × scale |
+| `outer_thickness_um` | μm | (BM − ONL) × scale |
+| `detachment_thickness_um` | μm | (DET_bot − DET_top) × scale |
+| `image_has_detachment` | bool | 이 이미지에 detachment 있음 |
+
+#### 보정 (HITL 저장 후 추가됨)
+| 컬럼 | 의미 |
+|---|---|
+| `TOP_y_corrected` | 사용자 보정 y. **빈 칸 = 자동값 사용**, 숫자 = 보정값, `"ERASED"` = 명시적 NaN |
+| `ONL_y_corrected`, `BM_y_corrected`, `DET_top_y_corrected`, `DET_bottom_y_corrected` | 동일 |
+| `total_thickness_um_corrected` | 보정 반영 망막 두께 (effective y로 재계산) |
+| `outer_thickness_um_corrected` | 보정 반영 외망막 두께 |
+| `detachment_thickness_um_corrected` | 보정 반영 detachment 두께 |
+| `corrected_by_user` | bool — 이 컬럼에 어느 boundary든 보정 있으면 True |
+
+### 8.4 `corrected_summary` 시트 (보정한 이미지 수 만큼의 rows)
+
+자동 vs 보정 비교 한눈에:
+
+| 컬럼 | 의미 |
+|---|---|
+| `filename` | 파일명 |
+| `n_corrected_cols` | 보정한 컬럼 수 (5 boundary 합산이 아닌, 어느 boundary든 손댄 컬럼 수) |
+| `corrected_TOP` | TOP을 보정했는지 (bool) |
+| `corrected_ONL`, `corrected_BM`, `corrected_DET` | 동일 |
+| `mean_total_um` | 자동 검출만 사용한 망막 두께 평균 (이전 값) |
+| `mean_total_um_corrected` | 보정 반영 망막 두께 평균 (**최종 값**) |
+| `edit_timestamp` | 마지막 저장 시각 |
+
+### 8.5 분석 예시 (Python)
+
+```python
+import pandas as pd
+import numpy as np
+
+# 한 이미지의 effective boundary
+df = pd.read_excel('oct_results.xlsx', sheet_name='21_OS_4H')
+eff_TOP = df['TOP_y_corrected'].combine_first(df['TOP_y'])
+eff_BM  = df['BM_y_corrected'].combine_first(df['BM_y'])
+total_um = (eff_BM - eff_TOP) * 3.87
+print(f'mean total = {total_um.mean():.2f} μm')
+
+# 96장 비교 표
+summary = pd.read_excel('oct_results.xlsx', sheet_name='corrected_summary')
+delta = summary['mean_total_um_corrected'] - summary['mean_total_um']
+print(summary[['filename', 'mean_total_um', 'mean_total_um_corrected']])
+print(f'평균 보정량: {delta.mean():.2f} μm')
+```
+
+### 8.6 주의
+
+- **`*_corrected` 컬럼이 없는 시트** = 한 번도 HITL 저장 안 된 이미지. 이 경우 `*` (자동) 컬럼이 최종값.
+- **xlsx는 export 결과물** — HITL의 canonical 저장소는 DB(`oct_results.db`). xlsx를 직접 수정하지 말 것 (다음 export 시 덮어씌어짐).
+- xlsx를 외부 분석 도구(Excel/pandas/R 등)에서 읽기 위해서만 사용.
+
+---
+
+## 9. 자주 쓰는 시나리오
 
 ### 시나리오 1: 한 이미지 빠르게 보정 후 저장
 ```
@@ -250,7 +389,7 @@ xlsx 시트에서:
 
 ---
 
-## 9. 트러블슈팅
+## 10. 트러블슈팅
 
 ### exe 실행 시 즉시 종료
 같은 폴더에 `_internal\` 디렉터리가 있는지 확인. zip 압축 해제가 부분적으로 됐을 수 있음.
@@ -277,7 +416,7 @@ xlsx export 중 오류. 가장 흔한 원인:
 
 ---
 
-## 10. 데이터 백업
+## 11. 데이터 백업
 
 가장 중요한 파일 단 하나:
 ```
@@ -290,7 +429,7 @@ data\mouse_data_org\output\db\oct_results.db
 
 ---
 
-## 11. 추가 정보
+## 12. 추가 정보
 
 - 소스 저장소: https://github.com/smpapa/mouse_retinal_analysis
 - 시스템 동작 원리 상세: 저장소의 `docs/hitl_flow.md`
