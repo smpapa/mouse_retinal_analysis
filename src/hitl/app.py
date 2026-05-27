@@ -313,6 +313,18 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Import failed",
                                       f"Could not import workbook: {e}")
                 return
+        # Refresh source_xlsx meta to the current path. The DB may have
+        # been packaged on a different machine where the source xlsx
+        # lived at a different absolute path; without this update, the
+        # Export to Excel menu would raise "No source xlsx recorded".
+        if self.workbook_path.exists():
+            try:
+                current = str(self.workbook_path.resolve())
+                stored = self._db.get_meta("source_xlsx")
+                if stored != current:
+                    self._db.set_meta("source_xlsx", current)
+            except Exception:
+                pass  # Non-fatal; export will still warn if source missing.
         self._refresh_image_meta_and_sidebar()
 
     def _refresh_image_meta_and_sidebar(self) -> None:
