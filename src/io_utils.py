@@ -154,31 +154,52 @@ def _bscan_left_edge_via_green_markers(rgb: np.ndarray) -> int | None:
     """Find the panel left edge from Heidelberg's green scan-position
     markers drawn on the IR fundus.
 
-    The IR fundus shows green horizontal lines (Heidelberg's per-scan
-    markers). Each line spans most of the IR panel width and is
-    cleanly clipped at the IR panel's right edge — which is exactly
-    the B-scan panel's left edge. Per row, count pure-green pixels
-    ((G > 200) & (R < 50) & (B < 50)); rows with > 50 such pixels are
-    "scan rows". The rightmost column in the left half of the image
-    that has any green from a scan row is the clip line.
+    The IR fundus shows pure-green scan-position lines (Heidelberg's
+    per-scan markers). Each line spans almost the full width of the
+    square IR panel and is cleanly clipped at the panel's edge — which
+    is exactly the B-scan panel's left edge.
 
-    Returns None when no scan-position markers are found (e.g. for
-    images that omit them).
+    Two orientations:
+      - **Horizontal scans (H suffix)**: a single row has many green
+        pixels. Its rightmost green column = IR panel right edge.
+      - **Vertical scans (V suffix)**: a single column has many green
+        pixels. Its bottommost green row = IR panel side length;
+        because the IR panel is square this equals the right edge.
+
+    Whichever dimension has the dominant line is the scan orientation.
+
+    Returns None when no scan-position markers are found.
     """
     H, W, _ = rgb.shape
     R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
     green_mask = (G > 200) & (R < 50) & (B < 50)
-    row_green_count = green_mask.sum(axis=1)
-    is_scan_row = row_green_count > 50
-    if not is_scan_row.any():
-        return None
     half = W // 2
-    scan_in_left = green_mask[is_scan_row][:, :half]
-    col_has_green = scan_in_left.any(axis=0)
-    sig_cols = np.where(col_has_green)[0]
-    if len(sig_cols) == 0:
+    if not green_mask[:, :half].any():
         return None
-    return int(sig_cols[-1]) + 1
+
+    # Count green pixels per row and per column in the left half.
+    row_green_count = green_mask[:, :half].sum(axis=1)
+    col_green_count = green_mask[:, :half].sum(axis=0)
+    max_row = int(row_green_count.max())
+    max_col = int(col_green_count.max())
+
+    # Whichever orientation is dominant tells us the scan type. Both
+    # H and V markers are ~495 pixels long; the other axis is fewer
+    # than ~25 pixels (just text labels at the top).
+    if max_row > max_col and max_row > 50:
+        # Horizontal scan marker — rightmost x of the dominant row.
+        best_row = int(np.argmax(row_green_count))
+        cols = np.where(green_mask[best_row, :half])[0]
+        if len(cols):
+            return int(cols[-1]) + 1
+    elif max_col > 50:
+        # Vertical scan marker — bottommost y of the dominant column.
+        # The IR panel is square, so panel side = panel right edge.
+        best_col = int(np.argmax(col_green_count))
+        rows = np.where(green_mask[:, best_col])[0]
+        if len(rows):
+            return int(rows[-1]) + 1
+    return None
 
 
 def _bscan_left_edge(rgb: np.ndarray) -> int | None:
