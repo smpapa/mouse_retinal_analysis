@@ -145,7 +145,8 @@ class MainWindow(QMainWindow):
             self._open_db_for_workbook()
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("OCT HITL Editor")
+        from ._version import __version__
+        self.setWindowTitle(f"OCT HITL Editor — v{__version__}")
         self.canvas = OverlayCanvas()
         self.canvas.edit_finished.connect(self._refresh_status)
         self.setCentralWidget(self.canvas)

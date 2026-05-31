@@ -32,6 +32,7 @@ hidden_imports = [
     "src.hitl.storage",
     "src.hitl.overlay_render",
     "src.hitl.batch_runner",
+    "src.hitl._version",
     "src.hitl.colors",
     "src.hitl.convert_annotations",
     "src.hitl.db",
