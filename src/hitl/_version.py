@@ -6,4 +6,4 @@ Used by:
 """
 from __future__ import annotations
 
-__version__ = "2026.05.11"
+__version__ = "2026.05.11.1"

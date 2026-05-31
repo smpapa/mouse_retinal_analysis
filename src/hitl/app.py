@@ -822,13 +822,19 @@ class MainWindow(QMainWindow):
         )
         if reply != QMessageBox.Yes:
             return
-        # Switch the in-memory paths first so _run_auto_analysis uses them,
-        # but skip _switch_data_folder's reload (the workbook does not
-        # exist yet).
+        # Fully detach from the previous data folder before triggering
+        # analysis on the new one. Without this, _on_batch_finished
+        # would re-import the new xlsx into the *previous* folder's DB,
+        # leaving the sidebar showing both folders' files at once.
+        if self._db is not None:
+            self._db.close()
+            self._db = None
         self.image_dir = folder
         self.workbook_path = workbook_path
         self._editors.clear()
         self._current_stem = None
+        self._image_meta.clear()
+        self.sidebar.set_entries([])
         self._run_auto_analysis()
 
     def _switch_data_folder(self, image_dir: Path,
