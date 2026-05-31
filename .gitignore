@@ -61,3 +61,9 @@ docs/쥐 데이터.zip
 
 # Project data (usually large / derived)
 data/
+
+# Distribution packages (large standalone .exe bundles produced by
+# PyInstaller — see docs/build_standalone.md). Keep these out of git;
+# they are uploaded as GitHub Releases / shared via file transfer.
+OctHitlEditor*.zip
+*.zip
